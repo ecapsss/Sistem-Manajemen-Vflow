@@ -1,0 +1,203 @@
+version: "3.0"
+metadata:
+  id: marketplace-fulfillment-saga
+  name: "Marketplace Fulfillment Saga"
+  description: |
+    Marketplace checkout saga. Reserves inventory, captures payment through a
+    child workflow, quotes shipment, joins the work, and commits shipment. Any
+    failure enters an ErrorBoundary and returns an operator-facing
+    compensation-required response.
+  dialect: vflow
+  tags: [example, p0, marketplace, saga, parallel, subworkflow, compensation]
+
+spec:
+  durability:
+    enabled: true
+    default_mode: eventual
+    compensation_timeout_ms: 30000
+
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        route: /examples/marketplace/checkout
+        webhook_config: { path: /examples/marketplace/checkout, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond-success
+      output_variable: trigger_payload
+
+    - id: normalize_checkout
+      activity_type: Transform
+      input_mappings:
+        - target: checkout
+          source:
+            language: v-cel
+            source: '{"checkout_id": trigger_payload.body.checkout_id, "idempotency_key": trigger_payload.body.idempotency_key, "customer_id": trigger_payload.body.customer_id, "amount": trigger_payload.body.amount, "currency": trigger_payload.body.currency, "items": trigger_payload.body.items, "ship_to": trigger_payload.body.ship_to}'
+      output_variable: checkout_context
+
+    - id: fork_fulfillment
+      activity_type: Parallel
+      description: "Reserve inventory, capture payment, and quote shipping concurrently."
+
+    - id: reserve_inventory
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+        timeout_ms: 3000
+      input_mappings:
+        - target: url
+          source: { language: literal, source: "http://127.0.0.1:18022/inventory/reserve" }
+        - target: body
+          source:
+            language: v-cel
+            source: '{"checkout_id": checkout_context.checkout_id, "items": checkout_context.items, "idempotency_key": checkout_context.idempotency_key}'
+      output_variable: inventory_reservation
+      compensation:
+        connector_ref: vastar.http
+        operation: post
+        input_mappings:
+          - target: url
+            source: { language: literal, source: "http://127.0.0.1:18022/inventory/release" }
+          - target: body
+            source:
+              language: v-cel
+              source: '{"checkout_id": checkout_context.checkout_id, "reservation": inventory_reservation}'
+
+    - id: capture_payment_child
+      activity_type: SubWorkflow
+      persistence: ssot
+      sub_workflow_config:
+        workflow_ref: marketplace-payment-capture-child
+        timeout_ms: 5000
+        input_strategy: mapped
+      input_mappings:
+        - target: checkout_id
+          source: { language: spv1, source: "$.checkout_context.checkout_id" }
+        - target: idempotency_key
+          source: { language: spv1, source: "$.checkout_context.idempotency_key" }
+        - target: amount
+          source: { language: spv1, source: "$.checkout_context.amount" }
+        - target: currency
+          source: { language: spv1, source: "$.checkout_context.currency" }
+      output_variable: payment_capture
+
+    - id: quote_shipment
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+        timeout_ms: 3000
+      input_mappings:
+        - target: url
+          source: { language: literal, source: "http://127.0.0.1:18022/shipping/quote" }
+        - target: body
+          source:
+            language: v-cel
+            source: '{"checkout_id": checkout_context.checkout_id, "items": checkout_context.items, "ship_to": checkout_context.ship_to}'
+      output_variable: shipment_quote
+
+    - id: join_fulfillment
+      activity_type: Join
+      description: "Wait for inventory, payment, and shipment quote."
+      output_variable: fulfillment_inputs
+
+    - id: commit_shipment
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+        timeout_ms: 3000
+      input_mappings:
+        - target: url
+          source: { language: literal, source: "http://127.0.0.1:18022/shipping/commit" }
+        - target: body
+          source:
+            language: v-cel
+            source: '{"checkout_id": checkout_context.checkout_id, "reservation": inventory_reservation, "payment": payment_capture, "quote": shipment_quote}'
+      output_variable: shipment_commit
+      compensation:
+        connector_ref: vastar.http
+        operation: post
+        input_mappings:
+          - target: url
+            source: { language: literal, source: "http://127.0.0.1:18022/shipping/cancel" }
+          - target: body
+            source:
+              language: v-cel
+              source: '{"checkout_id": checkout_context.checkout_id, "shipment": shipment_commit}'
+
+    - id: success_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"status": "fulfilled", "checkout_id": checkout_context.checkout_id, "inventory": inventory_reservation, "payment": payment_capture, "shipment": shipment_commit}'
+      output_variable: success_response
+
+    - id: fulfillment_error_boundary
+      activity_type: ErrorBoundary
+      description: "Operator-visible saga failure boundary before compensation response."
+
+    - id: backoff_before_failure_response
+      activity_type: Timer
+      description: "Short backoff hook; runtime policy decides actual wait behavior."
+
+    - id: failure_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"status": "compensation_required", "checkout_id": checkout_context.checkout_id, "reason": "fulfillment_side_effect_failed"}'
+      output_variable: failure_response
+
+    - id: respond-success
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.success_response" }
+
+    - id: respond-failure
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.failure_response" }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: normalize_checkout } }
+    - { id: f02, from: { node: normalize_checkout }, to: { node: fork_fulfillment } }
+    - { id: f03, from: { node: fork_fulfillment }, to: { node: reserve_inventory } }
+    - { id: f04, from: { node: fork_fulfillment }, to: { node: capture_payment_child } }
+    - { id: f05, from: { node: fork_fulfillment }, to: { node: quote_shipment } }
+    - { id: f06, from: { node: reserve_inventory }, to: { node: join_fulfillment } }
+    - { id: f07, from: { node: capture_payment_child }, to: { node: join_fulfillment } }
+    - { id: f08, from: { node: quote_shipment }, to: { node: join_fulfillment } }
+    - { id: f09, from: { node: join_fulfillment }, to: { node: commit_shipment } }
+    - { id: f10, from: { node: commit_shipment }, to: { node: success_response } }
+    - { id: f11, from: { node: success_response }, to: { node: respond-success } }
+    - { id: f12, type: error, from: { node: reserve_inventory }, to: { node: fulfillment_error_boundary } }
+    - { id: f13, type: error, from: { node: capture_payment_child }, to: { node: fulfillment_error_boundary } }
+    - { id: f14, type: error, from: { node: quote_shipment }, to: { node: fulfillment_error_boundary } }
+    - { id: f15, type: error, from: { node: commit_shipment }, to: { node: fulfillment_error_boundary } }
+    - { id: f16, from: { node: fulfillment_error_boundary }, to: { node: backoff_before_failure_response } }
+    - { id: f17, from: { node: backoff_before_failure_response }, to: { node: failure_response } }
+    - { id: f18, from: { node: failure_response }, to: { node: respond-failure } }
+    - { id: f19, from: { node: respond-success }, to: { node: end } }
+    - { id: f20, from: { node: respond-failure }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: checkout_context, type: object }
+    - { name: inventory_reservation, type: object }
+    - { name: payment_capture, type: object }
+    - { name: shipment_quote, type: object }
+    - { name: shipment_commit, type: object }

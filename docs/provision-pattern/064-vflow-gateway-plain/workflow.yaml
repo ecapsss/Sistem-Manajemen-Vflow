@@ -1,0 +1,101 @@
+version: "3.0"
+metadata:
+  id: vflow-gateway-plain
+  name: "vflow Plain Gateway (zero-copy byte forward)"
+  description: |
+    Plain gRPC forwarder workflow — pure byte pass-through, no
+    body decode, no JSON ↔ proto roundtrip on either direction.
+    Apple-to-apple with Envoy plain proxy.
+
+    Activities (3): Trigger → forward → respond.
+
+      - Trigger receives gRPC body as raw proto bytes (DataHandle).
+      - `forward` Connector reads those bytes via `bytes_ref` into
+        the `request` mapping; the fastpath dispatcher routes them
+        through `execute_with_request_bytes` so the gRPC connector
+        skips `json_to_dynamic_message` + `encode_to_vec` entirely.
+      - `raw_response: true` makes the connector return the upstream
+        proto wire bytes as `ConnectorOutput.data` with metadata
+        `response_format: "raw_proto_bytes"`. Fastpath dispatch
+        sees the marker, skips the wasted JSON parse on response,
+        and writes the bytes directly to the `upstream_response`
+        handle slot.
+      - `respond` EndTrigger uses `bytes_ref` to return those bytes
+        as the gRPC response body.
+
+    Total: zero JSON serialize/deserialize, zero proto encode, zero
+    proto decode anywhere on the request/response data path. The
+    only JSON envelope work is for the small connector config
+    fields (endpoint, descriptor_set_b64, service, method) — those
+    are static literals, evaluated once per request as a small
+    Map<String,Value>. A future optimization could bake those into
+    the FastpathConnectorNode plan at upload time.
+
+  dialect: vflow
+  tags: [example, p0, grpc, gateway, connector, bench, fastpath, plain, zerocopy]
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: grpc
+        runtime_mode: fastpath
+        grpc:
+          service: "examples.GatewayPlain"
+          method: "Passthrough"
+          body_schema: "examples.GatewayMessage"
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: forward
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.grpc
+        operation: call
+        timeout_ms: 5000
+      input_mappings:
+        - target: endpoint
+          source: { language: literal, source: "http://127.0.0.1:50071" }
+        - target: descriptor_set_b64
+          source:
+            language: literal
+            source: "CvkCCg1nYXRld2F5LnByb3RvEghleGFtcGxlcyJiCg5HYXRld2F5TWVzc2FnZRIbCgl0ZW5hbnRfaWQYASABKAlSCHRlbmFudElkEhkKCHRyYWNlX2lkGAIgASgJUgd0cmFjZUlkEhgKB3BheWxvYWQYAyABKAlSB3BheWxvYWQyTAoHR2F0ZXdheRJBCgtQYXNzdGhyb3VnaBIYLmV4YW1wbGVzLkdhdGV3YXlNZXNzYWdlGhguZXhhbXBsZXMuR2F0ZXdheU1lc3NhZ2UyUQoMR2F0ZXdheVByb3h5EkEKC1Bhc3N0aHJvdWdoEhguZXhhbXBsZXMuR2F0ZXdheU1lc3NhZ2UaGC5leGFtcGxlcy5HYXRld2F5TWVzc2FnZTJRCgxHYXRld2F5UGxhaW4SQQoLUGFzc3Rocm91Z2gSGC5leGFtcGxlcy5HYXRld2F5TWVzc2FnZRoYLmV4YW1wbGVzLkdhdGV3YXlNZXNzYWdlYgZwcm90bzM="
+        - target: service
+          source: { language: literal, source: "examples.Gateway" }
+        - target: method
+          source: { language: literal, source: "Passthrough" }
+        # Request payload as RAW WIRE BYTES from the trigger body
+        # handle. Fastpath dispatch detects `bytes_ref` on the
+        # `request` target and routes the bytes through the
+        # `execute_with_request_bytes` companion path — connector
+        # skips proto encode entirely.
+        - target: request
+          source: { language: bytes_ref, source: "trigger_body" }
+        # Connector returns the upstream's raw proto bytes as
+        # ConnectorOutput.data; dispatch mirrors them into
+        # `upstream_response`'s handle slot for `bytes_ref` below.
+        - target: raw_response
+          source: { language: literal, source: "true" }
+      output_variable: upstream_response
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response:
+          language: bytes_ref
+          source: "upstream_response"
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f1, from: { node: trigger }, to: { node: forward } }
+    - { id: f2, from: { node: forward }, to: { node: respond } }
+    - { id: f3, from: { node: respond }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload,   type: object }
+    - { name: upstream_response, type: object }

@@ -1,0 +1,178 @@
+version: "3.0"
+metadata:
+  id: kelompok3-umkm-penyelesaian-pesanan
+  name: "UMKM - Penyelesaian Pesanan"
+  active: true
+  description: |
+    Workflow 5. Menutup transaksi secara resmi dan memperbarui stok produk
+    di database. Durability dinyalakan secara eksplisit karena dua
+    write (update stok + update status) harus konsisten -> DB sebagai SSOT.
+  dialect: vflow
+  tags: [kelompok3, umkm, penyelesaian, postgres, durable, p0]
+
+spec:
+  durability:
+    enabled: true
+    default_mode: immediate
+
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        runtime_mode: standard
+        webhook_config: { path: /webhook/kelompok3/umkm/pesanan/selesaikan, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      durability: immediate
+      output_variable: trigger_payload
+
+    # Ambil detail item pesanan untuk pengurangan stok per produk.
+    - id: select_detail_pesanan
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: "pack://kelompok3-umkm/primary"
+        operation: raw_query
+        timeout_ms: 3000
+      input_mappings:
+        - target: query
+          source:
+            language: vil_query
+            dialect: postgres
+            source: |
+              select("detail_pesanan")
+                .alias("d")
+                .columns("d.produk_id, d.jumlah, p.stok")
+                .join("produk p", "p.id = d.produk_id")
+                .where_raw_bind("d.pesanan_id = ?::int", trigger_payload.pesanan_id)
+                .limit(1)
+      output_variable: detail_result
+
+    - id: loop_update_stok
+      activity_type: LoopForEach
+      loop_config:
+        collection: "detail_result.rows"
+        item_variable: item_detail
+        mode: sequential
+        max_iterations: 200
+
+    - id: select_produk_stok_item
+      activity_type: Connector
+      durability: immediate
+      persistence: ssot
+      connector_config:
+        connector_ref: "pack://kelompok3-umkm/primary"
+        operation: raw_query
+        timeout_ms: 3000
+        retry_policy:
+          max_attempts: 3
+          base_delay_ms: 100
+          max_delay_ms: 1000
+          backoff_factor: 2.0
+      input_mappings:
+        - target: query
+          source:
+            language: vil_query
+            dialect: postgres
+            source: |
+              select("produk")
+                .columns("id, stok")
+                .where_raw_bind("id = ?::int", detail_result.rows[0].produk_id)
+                .limit(1)
+      output_variable: produk_stok_result
+
+    - id: hitung_stok_baru
+      activity_type: Transform
+      input_mappings:
+        - target: stok_after
+          source:
+            language: v-cel
+            source: '{"produk_id": detail_result.rows[0].produk_id, "stok": detail_result.rows[0].stok - detail_result.rows[0].jumlah}'
+      output_variable: stok_after
+
+    - id: update_stok_item
+      activity_type: Connector
+      durability: immediate
+      persistence: ssot
+      connector_config:
+        connector_ref: "pack://kelompok3-umkm/primary"
+        operation: raw_query
+        timeout_ms: 3000
+        retry_policy:
+          max_attempts: 3
+          base_delay_ms: 100
+          max_delay_ms: 1000
+          backoff_factor: 2.0
+      input_mappings:
+        - target: query
+          source:
+            language: vil_query
+            dialect: postgres
+            source: |
+              update("produk")
+                .set_raw("stok", "stok - 2")
+                .where_raw_bind("id = ?::int", stok_after.produk_id)
+      output_variable: stok_update_result
+
+    - id: update_status_selesai
+      activity_type: Connector
+      durability: immediate
+      persistence: ssot
+      connector_config:
+        connector_ref: "pack://kelompok3-umkm/primary"
+        operation: raw_query
+        timeout_ms: 3000
+        retry_policy:
+          max_attempts: 3
+          base_delay_ms: 100
+          max_delay_ms: 1000
+          backoff_factor: 2.0
+      input_mappings:
+        - target: query
+          source:
+            language: vil_query
+            dialect: postgres
+            source: |
+              update("pesanan")
+                .set("status", "selesai")
+                .set_raw("updated_at", "now()")
+                .where_raw_bind("id = ?::int", trigger_payload.pesanan_id)
+      output_variable: status_update_result
+
+    - id: shape_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"status": "selesai", "pesanan_id": trigger_payload.pesanan_id}'
+      output_variable: final_response
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.final_response" }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: select_detail_pesanan } }
+    - { id: f02, from: { node: select_detail_pesanan }, to: { node: hitung_stok_baru } }
+    - { id: f04b, from: { node: hitung_stok_baru }, to: { node: update_stok_item } }
+    - { id: f05, from: { node: update_stok_item }, to: { node: update_status_selesai } }
+    - { id: f06, from: { node: update_status_selesai }, to: { node: shape_response } }
+    - { id: f07, from: { node: shape_response }, to: { node: respond } }
+    - { id: f08, from: { node: respond }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: detail_result, type: object }
+    - { name: item_detail, type: object }
+    - { name: produk_stok_result, type: object }
+    - { name: stok_after, type: object }
+    - { name: status_update_result, type: object }
+    - { name: stok_update_result, type: object }
+    - { name: final_response, type: object }

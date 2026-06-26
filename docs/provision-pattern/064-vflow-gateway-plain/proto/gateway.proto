@@ -1,0 +1,37 @@
+// Combined proto for 062 (passthrough) + 063 (V-Starlark gateway)
+// + 064 (plain proxy gateway). Three services share `GatewayMessage`.
+//
+// 062 — `Gateway/Passthrough` is the shared upstream both gateways
+//       forward to.
+// 063 — `GatewayProxy/Passthrough` is the V-Starlark-scripted gateway.
+// 064 — `GatewayPlain/Passthrough` is the plain forwarder gateway
+//       (no scripting; isolates Connector + proto-encode overhead
+//       so the V-Starlark vs Lua scripting cost can be measured
+//       cleanly by subtraction).
+
+syntax = "proto3";
+
+package examples;
+
+// 062 endpoint — pure passthrough.
+service Gateway {
+  rpc Passthrough(GatewayMessage) returns (GatewayMessage);
+}
+
+// 063 endpoint — vflow gateway with V-Starlark validation +
+// gRPC connector forwarding.
+service GatewayProxy {
+  rpc Passthrough(GatewayMessage) returns (GatewayMessage);
+}
+
+// 064 endpoint — vflow plain forwarder. No scripting. Connector +
+// proto_encode only. Apple-to-apple with Envoy plain proxy (B cell).
+service GatewayPlain {
+  rpc Passthrough(GatewayMessage) returns (GatewayMessage);
+}
+
+message GatewayMessage {
+  string tenant_id = 1;
+  string trace_id  = 2;
+  string payload   = 3;
+}

@@ -1,0 +1,42 @@
+version: "3.0"
+metadata:
+  id: versioning-canary-shadow-rollback
+  name: "Versioning Canary Shadow Rollback"
+  description: "Pricing workflow version 2 candidate with loyalty discount."
+  dialect: vflow
+  tags: [example, p1, versioning, canary, shadow, rollback, v2]
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        route: /examples/versioning/pricing
+        webhook_config: { path: /examples/versioning/pricing, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: quote_v2
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: literal
+            source: '{"status":"quoted","pricing_engine":"v2","discount_cents":5000,"rollout_stage":"candidate"}'
+      output_variable: quote_response
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.quote_response" }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: quote_v2 } }
+    - { id: f02, from: { node: quote_v2 }, to: { node: respond } }
+    - { id: f03, from: { node: respond }, to: { node: end } }

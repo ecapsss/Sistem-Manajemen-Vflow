@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package cloud;
+
+service CloudControl {
+  rpc ProvisionTenant(ProvisionRequest) returns (ProvisionResponse);
+}
+
+message ProvisionRequest {
+  string tenant_name = 1;
+  string plan = 2;
+}
+
+message ProvisionResponse {
+  string tenant_id = 1;
+  string status = 2;
+  string note = 3;
+}

@@ -1,0 +1,67 @@
+version: "3.0"
+metadata:
+  id: ai-gateway-simulator-benchmark
+  name: "AI Gateway Simulator Benchmark"
+  description: |
+    Blackbox workflow benchmark for a local AI gateway path.
+
+    Measured path:
+      wrk -> VFlow webhook -> vastar.http streaming connector ->
+      ai-endpoint-simulator -> VFlow chunked stream
+
+    This mirrors the historic 2026-04-19 vflow_http benchmark workflow shape:
+      webhook -> vastar.http streaming connector with OpenAI json_tap ->
+      literal upstream body -> chunked response.
+
+    The setup phase may upload and activate this workflow through the runtime
+    admin API, but the benchmark itself must only hit the webhook route.
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        runtime_mode: fastpath
+        webhook_config:
+          path: /api/gw/stream
+          method: POST
+        response_framing: chunked
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: call_simulator
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+        streaming: true
+        dialect: openai
+        json_tap: "choices[0].delta.content"
+        timeout_ms: 30000
+      input_mappings:
+        - target: url
+          source:
+            language: literal
+            source: "http://127.0.0.1:4545/v1/chat/completions"
+        - target: body
+          source:
+            language: literal
+            source: '{"model":"gpt-4","messages":[{"role":"user","content":"Benchmark performance test via VIL"}],"stream":true}'
+      output_variable: llm_result
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response:
+          language: vil-expr
+          source: '{"content": llm_result.content}'
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f1, from: { node: trigger }, to: { node: call_simulator } }
+    - { id: f2, from: { node: call_simulator }, to: { node: respond } }
+    - { id: f3, from: { node: respond }, to: { node: end } }

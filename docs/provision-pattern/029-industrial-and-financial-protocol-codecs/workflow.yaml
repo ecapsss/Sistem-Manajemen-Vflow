@@ -1,0 +1,175 @@
+version: "3.0"
+metadata:
+  id: industrial-and-financial-protocol-codecs
+  name: "Industrial and Financial Protocol Codecs"
+  description: |
+    Edge gateway workflow for payment authorization and factory telemetry. It
+    demonstrates stateless protocol codecs and declares industrial adapter
+    calls that require lab endpoints for live E2E execution.
+  dialect: vflow
+  tags: [example, p1, protocol-codecs, payments, industrial]
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        route: /examples/protocols/terminal-telemetry
+        webhook_config: { path: /examples/protocols/terminal-telemetry, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: validate_edge_event
+      activity_type: Validate
+      validate_config:
+        input: "$.trigger_payload.body"
+        schema:
+          required: [terminal_id, transaction_id, amount_cents, machine_node]
+          properties:
+            terminal_id: { type: string, min_length: 4 }
+            transaction_id: { type: string, min_length: 6 }
+            amount_cents: { type: integer, minimum: 1 }
+            machine_node: { type: string, min_length: 3 }
+      output_variable: validated_edge_event
+
+    - id: build_protocol_context
+      activity_type: Transform
+      input_mappings:
+        - target: protocol_context
+          source:
+            language: v-cel
+            source: '{"terminal_id": trigger_payload.body.terminal_id, "transaction_id": trigger_payload.body.transaction_id, "amount_cents": trigger_payload.body.amount_cents, "machine_node": trigger_payload.body.machine_node, "stan": "123456", "iso_amount": "000000" + string(trigger_payload.body.amount_cents), "operator_topic": "examples.protocols.edge"}'
+      output_variable: protocol_context
+
+    - id: iso8583_authorization_encode
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.iso8583
+        operation: encode
+      input_mappings:
+        - target: mti
+          source: { language: literal, source: "0200" }
+        - target: fields
+          source:
+            language: v-cel
+            source: '{"3": "000000", "4": protocol_context.iso_amount, "11": protocol_context.stan, "41": protocol_context.terminal_id}'
+      output_variable: iso8583_auth
+
+    - id: protobuf_event_encode
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.protobuf
+        operation: encode
+      input_mappings:
+        - target: schema
+          source:
+            language: literal
+            source: '{"name":"EdgePaymentEvent","fields":[{"name":"transaction_id","number":1,"type":"string"},{"name":"terminal_id","number":2,"type":"string"},{"name":"amount_cents","number":3,"type":"int64"}]}'
+        - target: data
+          source:
+            language: v-cel
+            source: '{"transaction_id": protocol_context.transaction_id, "terminal_id": protocol_context.terminal_id, "amount_cents": protocol_context.amount_cents}'
+      output_variable: protobuf_event
+
+    - id: msgpack_event_encode
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.msgpack
+        operation: encode
+      input_mappings:
+        - target: value
+          source:
+            language: v-cel
+            source: '{"transaction_id": protocol_context.transaction_id, "terminal_id": protocol_context.terminal_id, "machine_node": protocol_context.machine_node, "rail": "edge-terminal"}'
+      output_variable: msgpack_event
+
+    - id: notify_operator_ws
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.websocket
+        operation: broadcast
+      input_mappings:
+        - target: topic
+          source: { language: spv1, source: "$.protocol_context.operator_topic" }
+        - target: message
+          source:
+            language: v-cel
+            source: '{"transaction_id": protocol_context.transaction_id, "terminal_id": protocol_context.terminal_id, "status": "encoded"}'
+      output_variable: websocket_notice
+
+    - id: soap_erp_reservation
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.soap
+        operation: call_action
+      input_mappings:
+        - target: action
+          source: { language: literal, source: "urn:examples:ReserveTerminalBatch" }
+        - target: namespace
+          source: { language: literal, source: "urn:examples:industrial" }
+        - target: body
+          source:
+            language: v-cel
+            source: '"<ReserveTerminalBatch><TransactionId>" + protocol_context.transaction_id + "</TransactionId></ReserveTerminalBatch>"'
+      output_variable: soap_result
+
+    - id: modbus_machine_poll
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.modbus
+        operation: read_registers
+      input_mappings:
+        - target: address
+          source: { language: literal, source: "100" }
+        - target: count
+          source: { language: literal, source: "4" }
+      output_variable: modbus_registers
+
+    - id: opcua_node_read
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.opcua
+        operation: read_node
+      input_mappings:
+        - target: node_id
+          source: { language: spv1, source: "$.protocol_context.machine_node" }
+      output_variable: opcua_node
+
+    - id: accepted_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"status": "encoded", "transaction_id": protocol_context.transaction_id, "terminal_id": protocol_context.terminal_id, "protocols": ["iso8583", "protobuf", "msgpack", "websocket", "soap", "modbus", "opcua"]}'
+      output_variable: final_response
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.final_response" }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: validate_edge_event } }
+    - { id: f02, from: { node: validate_edge_event }, to: { node: build_protocol_context } }
+    - { id: f03, from: { node: build_protocol_context }, to: { node: iso8583_authorization_encode } }
+    - { id: f04, from: { node: iso8583_authorization_encode }, to: { node: protobuf_event_encode } }
+    - { id: f05, from: { node: protobuf_event_encode }, to: { node: msgpack_event_encode } }
+    - { id: f06, from: { node: msgpack_event_encode }, to: { node: notify_operator_ws } }
+    - { id: f07, from: { node: notify_operator_ws }, to: { node: soap_erp_reservation } }
+    - { id: f08, from: { node: soap_erp_reservation }, to: { node: modbus_machine_poll } }
+    - { id: f09, from: { node: modbus_machine_poll }, to: { node: opcua_node_read } }
+    - { id: f10, from: { node: opcua_node_read }, to: { node: accepted_response } }
+    - { id: f11, from: { node: accepted_response }, to: { node: respond } }
+    - { id: f12, from: { node: respond }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: protocol_context, type: object }
+    - { name: final_response, type: object }

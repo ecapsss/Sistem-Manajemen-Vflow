@@ -1,0 +1,68 @@
+version: "3.0"
+metadata:
+  id: 3tier-checkout
+  name: "StateStore Snapshot Policy — Checkout Pipeline"
+  # VFlow-exclusive: workflow-level snapshot policy + per-step durability.
+  # Runtime backend choice is configured by the runtime deployment
+  # (redb/TiKV/etc.); workflow YAML declares semantics, not a DB topology.
+  durability:
+    mode: external-io-snapshot
+    storage:
+      compression: zstd
+      encryption: aes256
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        webhook_config: { path: /api/checkout, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+    - id: cart_lookup
+      activity_type: Transform
+      durability: non_durable
+      input_mappings:
+        - target: cart
+          source: { language: v-cel, source: 'trigger_payload.body.cart' }
+        - target: user_id
+          source: { language: v-cel, source: 'trigger_payload.body.user_id' }
+      output_variable: cart_data
+    - id: price_calc
+      activity_type: VRule
+      durability: eventual
+      rule_config:
+        rule_set_id: pricing_rules_v1
+      input_mappings:
+        - target: items
+          source: { language: v-cel, source: 'cart_data.cart.items' }
+        - target: user_tier
+          source: { language: v-cel, source: 'trigger_payload.body.membership_tier' }
+      output_variable: pricing
+    - id: payment_reserve
+      activity_type: Connector
+      durability: immediate
+      persistence: ssot         # P4.20: payment reservation is authoritative; store receipt
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+      input_mappings:
+        - target: url
+          source: { language: literal, source: "http://payment-gw/api/reserve" }
+        - target: body
+          source: { language: v-cel, source: '{"user_id": cart_data.user_id, "amount": pricing.total}' }
+      output_variable: payment_result
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: v-cel, source: '{"order_id": payment_result.order_id, "total": pricing.total, "status": "reserved"}' }
+    - id: end
+      activity_type: End
+  flows:
+    - { id: f1, from: { node: trigger }, to: { node: cart_lookup } }
+    - { id: f2, from: { node: cart_lookup }, to: { node: price_calc } }
+    - { id: f3, from: { node: price_calc }, to: { node: payment_reserve } }
+    - { id: f4, from: { node: payment_reserve }, to: { node: respond } }
+    - { id: f5, from: { node: respond }, to: { node: end } }

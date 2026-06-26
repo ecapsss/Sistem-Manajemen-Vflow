@@ -1,0 +1,60 @@
+schema_ref:
+  path: "../schemas/fastpath_risk_fact_v1.yaml"
+  namespace: "examples.fastpath"
+  entity: "fastpath_risk_fact"
+  version: 1
+hit_policy: PRIORITY
+rules:
+  - id: "FASTPATH_BLOCKED_MERCHANT"
+    priority: 0
+    enabled: true
+    description: "Reject explicitly blocked merchant categories."
+    when: "merchant_category == 'blocked'"
+    then:
+      - kind: EMIT
+        severity: ERROR
+        code: "FASTPATH_BLOCKED_MERCHANT"
+        field: "merchant_category"
+        msg: "Merchant category is blocked"
+      - kind: ADD_SCORE
+        score_delta: 100
+      - kind: SET_DECISION
+        decision: REJECT
+
+  - id: "FASTPATH_CROSS_BORDER_HIGH_VALUE"
+    priority: 10
+    enabled: true
+    description: "Step up cross-border or high-value payments."
+    when: "amount >= 20000000 OR country != 'ID' OR velocity_1h >= 5"
+    then:
+      - kind: EMIT
+        severity: WARN
+        code: "FASTPATH_STEP_UP"
+        field: "amount"
+        msg: "Step-up authentication required"
+      - kind: ADD_SCORE
+        score_delta: 45
+      - kind: SET_DECISION
+        decision: CHALLENGE_MFA
+
+  - id: "FASTPATH_GOLD_APPROVE"
+    priority: 50
+    enabled: true
+    description: "Approve gold-tier customers under the step-up threshold."
+    when: "customer_tier == 'gold' AND amount >= 1"
+    then:
+      - kind: ADD_SCORE
+        score_delta: 0
+      - kind: SET_DECISION
+        decision: ACCEPT
+
+  - id: "FASTPATH_STANDARD_APPROVE"
+    priority: 100
+    enabled: true
+    description: "Approve standard low-risk payments."
+    when: "amount >= 1"
+    then:
+      - kind: ADD_SCORE
+        score_delta: 0
+      - kind: SET_DECISION
+        decision: ACCEPT

@@ -1,0 +1,30 @@
+// Combined proto for 062 (passthrough) + 063 (vflow gateway).
+//
+// `Gateway/Passthrough` (062) is the shared upstream both gateways
+// forward to. `GatewayProxy/Passthrough` (063) is the vflow gateway
+// front-end that performs light V-Starlark validation and forwards
+// the request via the gRPC connector to `Gateway/Passthrough`.
+//
+// Same `GatewayMessage` type both ways so the head-to-head bench
+// against Envoy + Lua filter can hold the wire format constant.
+
+syntax = "proto3";
+
+package examples;
+
+// 062 endpoint — pure passthrough.
+service Gateway {
+  rpc Passthrough(GatewayMessage) returns (GatewayMessage);
+}
+
+// 063 endpoint — vflow gateway with V-Starlark validation +
+// gRPC connector forwarding to Gateway/Passthrough.
+service GatewayProxy {
+  rpc Passthrough(GatewayMessage) returns (GatewayMessage);
+}
+
+message GatewayMessage {
+  string tenant_id = 1;
+  string trace_id  = 2;
+  string payload   = 3;
+}

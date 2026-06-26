@@ -1,0 +1,134 @@
+version: "3.0"
+metadata:
+  id: broker-trigger-lab-runtime-e2e
+  name: "Broker Trigger Lab Runtime E2E"
+  description: |
+    Runtime E2E fixture for bootstrapped local broker labs. The main
+    workflow.yaml keeps the full broker matrix contract, including broker
+    trigger declarations and provider connectors. This runtime fixture focuses
+    on broker families that the local bootstrap can verify end-to-end:
+    Kafka, MQTT, RabbitMQ, and SQS.
+  dialect: vflow
+  tags: [example, p0, brokers, runtime-e2e]
+
+spec:
+  durability:
+    enabled: true
+    default_mode: journal-state
+
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        route: /examples/brokers/runtime-e2e
+        webhook_config: { path: /examples/brokers/runtime-e2e, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: validate_event
+      activity_type: Validate
+      validate_config:
+        input: "$.trigger_payload.body"
+        schema:
+          required: [event_id, order_id, tenant_id, idempotency_key]
+          properties:
+            event_id: { type: string, min_length: 4 }
+            order_id: { type: string, min_length: 3 }
+            tenant_id: { type: string, min_length: 3 }
+            idempotency_key: { type: string, min_length: 8 }
+      output_variable: validated_event
+
+    - id: normalize_event
+      activity_type: Transform
+      input_mappings:
+        - target: broker_context
+          source:
+            language: v-cel
+            source: '{"event_id": trigger_payload.body.event_id, "order_id": trigger_payload.body.order_id, "tenant_id": trigger_payload.body.tenant_id, "idempotency_key": trigger_payload.body.idempotency_key, "payload": {"event_id": trigger_payload.body.event_id, "order_id": trigger_payload.body.order_id, "tenant_id": trigger_payload.body.tenant_id, "source": "runtime-e2e"}}'
+      output_variable: broker_context
+
+    - id: publish_kafka
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.kafka
+        operation: publish
+      input_mappings:
+        - target: topic
+          source: { language: literal, source: "examples.brokers.runtime-e2e" }
+        - target: payload
+          source: { language: spv1, source: "$.broker_context.payload" }
+      output_variable: kafka_publish
+
+    - id: publish_mqtt
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.mqtt
+        operation: publish
+      input_mappings:
+        - target: topic
+          source: { language: literal, source: "examples/brokers/runtime-e2e" }
+        - target: payload
+          source: { language: spv1, source: "$.broker_context.payload" }
+      output_variable: mqtt_publish
+
+    - id: publish_rabbitmq
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.rabbitmq
+        operation: publish
+      input_mappings:
+        - target: routing_key
+          source: { language: literal, source: "vflow-broker-lab" }
+        - target: payload
+          source: { language: spv1, source: "$.broker_context.payload" }
+      output_variable: rabbitmq_publish
+
+    - id: send_sqs
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.sqs
+        operation: send
+      input_mappings:
+        - target: body
+          source: { language: spv1, source: "$.broker_context.payload" }
+      output_variable: sqs_send
+
+    - id: accepted_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"status": "fanout-committed", "event_id": broker_context.event_id, "order_id": broker_context.order_id, "broker_families": ["kafka", "mqtt", "rabbitmq", "sqs"]}'
+      output_variable: final_response
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.final_response" }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: validate_event } }
+    - { id: f02, from: { node: validate_event }, to: { node: normalize_event } }
+    - { id: f03, from: { node: normalize_event }, to: { node: publish_kafka } }
+    - { id: f04, from: { node: publish_kafka }, to: { node: publish_mqtt } }
+    - { id: f05, from: { node: publish_mqtt }, to: { node: publish_rabbitmq } }
+    - { id: f06, from: { node: publish_rabbitmq }, to: { node: send_sqs } }
+    - { id: f07, from: { node: send_sqs }, to: { node: accepted_response } }
+    - { id: f08, from: { node: accepted_response }, to: { node: respond } }
+    - { id: f09, from: { node: respond }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: broker_context, type: object }
+    - { name: final_response, type: object }

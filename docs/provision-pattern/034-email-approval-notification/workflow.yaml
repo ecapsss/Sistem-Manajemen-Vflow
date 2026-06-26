@@ -1,0 +1,46 @@
+version: "3.0"
+metadata:
+  id: email-approval-notification
+  name: "Email Approval Notification"
+  description: |
+    Runtime-local workflow that receives an email event and sends an outbound
+    notification through the built-in send_email FaaS helper.
+  dialect: vflow
+  tags: [example, p0, email, notification]
+
+spec:
+  durability:
+    enabled: true
+    default_mode: eventual
+
+  activities:
+    - id: email_in
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: email
+        route: /examples/email/approval
+        email:
+          imap_url: "localhost"
+          mailbox: "INBOX"
+      output_variable: email_payload
+
+    - id: notify_ops
+      activity_type: Transform
+      input_mappings:
+        - target: notification
+          source:
+            language: v-cel
+            source: >
+              send_email(
+                "ops@example.test",
+                "Approval requested: " + string(email_payload.subject),
+                "From: " + string(email_payload.from) + "\n\n" + string(email_payload.body)
+              )
+      output_variable: notification_result
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f1, from: { node: email_in }, to: { node: notify_ops } }
+    - { id: f2, from: { node: notify_ops }, to: { node: end } }

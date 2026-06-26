@@ -1,0 +1,115 @@
+version: "3.0"
+metadata:
+  id: fastpath-vstarlark-risk-scoring
+  name: "Fastpath V-Starlark Risk Scoring"
+  description: "Same stateless payment risk decision as example 047, implemented with prepared V-Starlark."
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        runtime_mode: fastpath
+        webhook_config: { path: /bench/fastpath/vstarlark-risk, method: POST }
+        response_framing: length_prefixed
+      output_variable: trigger_payload
+
+    - id: score_risk
+      activity_type: Compute
+      compute_config:
+        language: v-starlark
+        source: |
+          def run(ctx):
+              amount = ctx["amount"]
+              country = ctx["country"]
+              merchant_category = ctx["merchant_category"]
+              customer_tier = ctx["customer_tier"]
+              velocity_1h = ctx["velocity_1h"]
+
+              if merchant_category == "blocked":
+                  return {
+                      "findings": [{
+                          "severity": "ERROR",
+                          "code": "FASTPATH_BLOCKED_MERCHANT",
+                          "field": "merchant_category",
+                          "message": "Merchant category is blocked",
+                      }],
+                      "total_score": 100,
+                      "decision": "REJECT",
+                      "findings_count": 1,
+                      "out": {},
+                  }
+
+              if amount >= 20000000 or country != "ID" or velocity_1h >= 5:
+                  return {
+                      "findings": [{
+                          "severity": "WARN",
+                          "code": "FASTPATH_STEP_UP",
+                          "field": "amount",
+                          "message": "Step-up authentication required",
+                      }],
+                      "total_score": 45,
+                      "decision": "CHALLENGE_MFA",
+                      "findings_count": 1,
+                      "out": {},
+                  }
+
+              if customer_tier == "gold" and amount >= 1:
+                  return {
+                      "findings": [],
+                      "total_score": 0,
+                      "decision": "ACCEPT",
+                      "findings_count": 0,
+                      "out": {},
+                  }
+
+              if amount >= 1:
+                  return {
+                      "findings": [],
+                      "total_score": 0,
+                      "decision": "ACCEPT",
+                      "findings_count": 0,
+                      "out": {},
+                  }
+
+              return {
+                  "findings": [],
+                  "total_score": 0,
+                  "decision": "UNSET",
+                  "findings_count": 0,
+                  "out": {},
+              }
+        entry_fn: run
+        budget_profile: none
+        timeout_ms: 1000
+      input_mappings:
+        - target: amount
+          source: { language: spv1, source: "$.trigger_payload.body.amount" }
+        - target: country
+          source: { language: spv1, source: "$.trigger_payload.body.country" }
+        - target: card_bin
+          source: { language: spv1, source: "$.trigger_payload.body.card_bin" }
+        - target: merchant_category
+          source: { language: spv1, source: "$.trigger_payload.body.merchant_category" }
+        - target: customer_tier
+          source: { language: spv1, source: "$.trigger_payload.body.customer_tier" }
+        - target: velocity_1h
+          source: { language: spv1, source: "$.trigger_payload.body.velocity_1h" }
+      output_variable: risk_result
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response:
+          language: spv1
+          source: "$.risk_result"
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f1, from: { node: trigger }, to: { node: score_risk } }
+    - { id: f2, from: { node: score_risk }, to: { node: respond } }
+    - { id: f3, from: { node: respond }, to: { node: end } }

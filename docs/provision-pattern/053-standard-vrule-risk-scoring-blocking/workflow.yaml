@@ -1,0 +1,62 @@
+version: "3.0"
+metadata:
+  id: standard-vrule-risk-scoring-blocking
+  name: "Standard V-Rule Risk Scoring Blocking"
+  description: "Standard runtime payment risk scoring with audit-record construction kept on the synchronous response path."
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        webhook_config: { path: /bench/standard/vrule-risk-blocking, method: POST }
+        response_framing: length_prefixed
+      output_variable: trigger_payload
+
+    - id: score_risk
+      activity_type: VRule
+      rule_config:
+        tenant_id: examples
+        rule_set_id: fastpath_risk_v1
+        version_policy: latest
+      input_mappings:
+        - target: amount
+          source: { language: spv1, source: "$.trigger_payload.body.amount" }
+        - target: country
+          source: { language: spv1, source: "$.trigger_payload.body.country" }
+        - target: card_bin
+          source: { language: spv1, source: "$.trigger_payload.body.card_bin" }
+        - target: merchant_category
+          source: { language: spv1, source: "$.trigger_payload.body.merchant_category" }
+        - target: customer_tier
+          source: { language: spv1, source: "$.trigger_payload.body.customer_tier" }
+        - target: velocity_1h
+          source: { language: spv1, source: "$.trigger_payload.body.velocity_1h" }
+      output_variable: risk_result
+
+    - id: build_audit_record
+      activity_type: Transform
+      input_mappings:
+        - target: audit_record
+          source:
+            language: v-cel
+            source: '{"event_type":"payment_risk_decision","mode":"standard_blocking","decision":risk_result.decision,"total_score":risk_result.total_score,"findings_count":risk_result.findings_count,"amount":trigger_payload.body.amount,"country":trigger_payload.body.country,"customer_tier":trigger_payload.body.customer_tier}'
+      output_variable: audit_record
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response:
+          language: spv1
+          source: "$.risk_result"
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f1, from: { node: trigger }, to: { node: score_risk } }
+    - { id: f2, from: { node: score_risk }, to: { node: build_audit_record } }
+    - { id: f3, from: { node: build_audit_record }, to: { node: respond } }
+    - { id: f4, from: { node: respond }, to: { node: end } }

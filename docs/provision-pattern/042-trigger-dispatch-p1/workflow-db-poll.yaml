@@ -1,0 +1,40 @@
+version: "3.0"
+metadata:
+  id: p1-trigger-dispatch-db-poll
+  name: "P1 DB poll trigger dispatch"
+  description: |
+    Runtime contract: db_poll trigger reads new rows and dispatches them through
+    the kernel into a normal HTTP connector side effect.
+
+spec:
+  activities:
+    - id: db_poll_in
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: db_poll
+        route: /examples/p1/triggers/db-poll
+        db_poll:
+          database_url: "__SQLITE_URL__"
+          query: "SELECT id, order_id, status FROM p1_orders WHERE id > ? ORDER BY id LIMIT 10"
+          interval_ms: 1000
+      output_variable: trigger_payload
+
+    - id: capture
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+        timeout_ms: 3000
+      input_mappings:
+        - target: url
+          source: { language: literal, source: "__CAPTURE_URL__/events/db-poll" }
+        - target: body
+          source: { language: v-cel, source: "trigger_payload" }
+      output_variable: capture_result
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f1, from: { node: db_poll_in }, to: { node: capture } }
+    - { id: f2, from: { node: capture }, to: { node: end } }

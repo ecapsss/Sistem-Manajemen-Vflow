@@ -1,0 +1,75 @@
+version: "3.0"
+metadata:
+  id: timer-expression-runtime-contract
+  name: "Timer Transform Runtime Contract"
+  description: |
+    Runtime-local contract for Transform and Timer nodes. A webhook request is
+    scored with V-CEL, then delayed by a short timer before responding. This is
+    intentionally local-safe so it can be part of example regression.
+  dialect: vflow
+  tags: [example, p1, timer, transform, runtime-contract]
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        route: /examples/timer-expression
+        webhook_config: { path: /examples/timer-expression, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: calculate_score
+      activity_type: Transform
+      input_mappings:
+        - target: status
+          source:
+            language: literal
+            source: "timer_expression_ok"
+        - target: score
+          source:
+            language: v-cel
+            source: 'trigger_payload.body.subtotal >= 500000 ? 75 : 25'
+        - target: priority
+          source:
+            language: v-cel
+            source: 'trigger_payload.body.subtotal >= 1000000 ? "review" : "standard"'
+        - target: customer_id
+          source:
+            language: v-cel
+            source: 'trigger_payload.body.customer_id'
+        - target: timer_delay_ms
+          source:
+            language: v-cel
+            source: '25'
+
+    - id: debounce_window
+      activity_type: Timer
+      timer_config:
+        delay_ms: 25
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response:
+          language: v-cel
+          source: '{"status": "timer_expression_ok", "customer_id": customer_id, "score": score, "priority": priority, "timer_delay_ms": timer_delay_ms}'
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: calculate_score } }
+    - { id: f02, from: { node: calculate_score }, to: { node: debounce_window } }
+    - { id: f03, from: { node: debounce_window }, to: { node: respond } }
+    - { id: f04, from: { node: respond }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: customer_id, type: string }
+    - { name: score, type: number }
+    - { name: priority, type: string }
+    - { name: timer_delay_ms, type: number }

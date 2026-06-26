@@ -1,0 +1,18 @@
+version: 1
+namespace: examples.payments
+schema_version: 1
+domain: payments
+entity: payment_risk_fact
+fields:
+  - path: trigger_payload.body.amount
+    scalar: F64
+    nullable: false
+  - path: trigger_payload.body.country
+    scalar: SYM
+    nullable: false
+  - path: trigger_payload.body.card_bin
+    scalar: SYM
+    nullable: false
+  - path: trigger_payload.body.merchant_category
+    scalar: SYM
+    nullable: false

@@ -1,0 +1,80 @@
+version: "3.0"
+metadata:
+  id: standard-vrule-risk-scoring-detached-nats-publish
+  name: "Standard V-Rule Risk Scoring Detached NATS Publish"
+  description: "Same payment risk decision as example 049 with direct detached materialized audit-event publish to NATS."
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        webhook_config: { path: /bench/standard/vrule-risk-detached-nats, method: POST }
+        response_framing: length_prefixed
+      output_variable: trigger_payload
+
+    - id: score_risk
+      activity_type: VRule
+      rule_config:
+        tenant_id: examples
+        rule_set_id: fastpath_risk_v1
+        version_policy: latest
+      input_mappings:
+        - target: amount
+          source: { language: spv1, source: "$.trigger_payload.body.amount" }
+        - target: country
+          source: { language: spv1, source: "$.trigger_payload.body.country" }
+        - target: card_bin
+          source: { language: spv1, source: "$.trigger_payload.body.card_bin" }
+        - target: merchant_category
+          source: { language: spv1, source: "$.trigger_payload.body.merchant_category" }
+        - target: customer_tier
+          source: { language: spv1, source: "$.trigger_payload.body.customer_tier" }
+        - target: velocity_1h
+          source: { language: spv1, source: "$.trigger_payload.body.velocity_1h" }
+      output_variable: risk_result
+
+    - id: build_audit_record
+      activity_type: Transform
+      input_mappings:
+        - target: audit_record
+          source:
+            language: v-cel
+            source: '{"event_type":"payment_risk_decision","mode":"standard_detached_nats","decision":risk_result.decision,"total_score":risk_result.total_score,"findings_count":risk_result.findings_count,"amount":trigger_payload.body.amount,"country":trigger_payload.body.country,"customer_tier":trigger_payload.body.customer_tier}'
+      output_variable: audit_record
+
+    - id: publish_audit_event
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.nats
+        operation: publish
+        timeout_ms: 1000
+      input_mappings:
+        - target: subject
+          source: { language: literal, source: "bench.risk.audit.workflow.v1" }
+        - target: payload
+          source: { language: spv1, source: "$.audit_record" }
+      output_variable: audit_publish
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response:
+          language: spv1
+          source: "$.risk_result"
+
+    - id: audit_end
+      activity_type: End
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f1, from: { node: trigger }, to: { node: score_risk } }
+    - { id: f2, from: { node: score_risk }, to: { node: respond } }
+    - { id: f3, from: { node: respond }, to: { node: end } }
+    - { id: f4, from: { node: score_risk }, to: { node: build_audit_record }, detached: true }
+    - { id: f5, from: { node: build_audit_record }, to: { node: publish_audit_event } }
+    - { id: f6, from: { node: publish_audit_event }, to: { node: audit_end } }

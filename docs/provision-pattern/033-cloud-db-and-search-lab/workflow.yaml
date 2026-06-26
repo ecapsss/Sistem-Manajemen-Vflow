@@ -1,0 +1,208 @@
+version: "3.0"
+metadata:
+  id: cloud-db-and-search-lab
+  name: "Cloud DB and Search Lab"
+  description: |
+    Customer profile enrichment lab for SQL, document, search, graph, and
+    key/value backends. All provider-backed connectors are local/lab optional
+    and must be validated with explicit endpoint env before docs claim a live
+    pass on a target machine.
+  dialect: vflow
+  tags: [example, p2, database, search, cloud-lab]
+
+spec:
+  durability:
+    enabled: true
+    default_mode: journal-state
+
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        route: /examples/cloud-db/customer-profile
+        webhook_config: { path: /examples/cloud-db/customer-profile, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: validate_profile
+      activity_type: Validate
+      validate_config:
+        input: "$.trigger_payload.body"
+        schema:
+          required: [customer_id, profile_version, email, idempotency_key]
+          properties:
+            customer_id: { type: string, min_length: 3 }
+            profile_version: { type: integer, minimum: 1 }
+            email: { type: string, min_length: 5 }
+            idempotency_key: { type: string, min_length: 8 }
+      output_variable: validated_profile
+
+    - id: normalize_profile
+      activity_type: Transform
+      annotations:
+        failure_semantics:
+          idempotency_key: "$.trigger_payload.body.idempotency_key"
+          retryable_classes: [connection, timeout, throttled]
+          non_retryable_classes: [schema, constraint, auth, permission]
+      input_mappings:
+        - target: profile_context
+          source:
+            language: v-cel
+            source: '{"customer_id": trigger_payload.body.customer_id, "profile_version": trigger_payload.body.profile_version, "email": trigger_payload.body.email, "idempotency_key": trigger_payload.body.idempotency_key, "segment": "standard", "search_index": "examples_customer_profiles", "graph_label": "Customer"}'
+      output_variable: profile_context
+
+    - id: upsert_postgres_primary
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.postgres
+        operation: raw_query
+      input_mappings:
+        - target: sql
+          source:
+            language: literal
+            source: "insert into customer_profiles(customer_id, profile_version, email, segment) values ($1, $2, $3, $4) on conflict (customer_id) do update set profile_version = excluded.profile_version, email = excluded.email, segment = excluded.segment"
+        - target: params
+          source:
+            language: v-cel
+            source: '[profile_context.customer_id, profile_context.profile_version, profile_context.email, profile_context.segment]'
+      output_variable: postgres_primary
+
+    - id: mirror_mysql_read_model
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.mysql
+        operation: raw_query
+      input_mappings:
+        - target: sql
+          source:
+            language: literal
+            source: "replace into customer_profile_read_model(customer_id, profile_version, email, segment) values (?, ?, ?, ?)"
+        - target: params
+          source:
+            language: v-cel
+            source: '[profile_context.customer_id, profile_context.profile_version, profile_context.email, profile_context.segment]'
+      output_variable: mysql_read_model
+
+    - id: mirror_yugabyte_geo_index
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.yugabyte
+        operation: raw_query
+      input_mappings:
+        - target: sql
+          source:
+            language: literal
+            source: "insert into customer_profile_geo(customer_id, profile_version, region) values ($1, $2, $3) on conflict (customer_id) do update set profile_version = excluded.profile_version, region = excluded.region"
+        - target: params
+          source:
+            language: v-cel
+            source: '[profile_context.customer_id, profile_context.profile_version, "global"]'
+      output_variable: yugabyte_geo_index
+
+    - id: write_mongo_profile_doc
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.mongo
+        operation: update_one
+        config:
+          entity: customer_profiles
+      input_mappings:
+        - target: collection
+          source: { language: literal, source: "customer_profiles" }
+        - target: filter
+          source:
+            language: v-cel
+            source: '{"customer_id": profile_context.customer_id}'
+        - target: update
+          source:
+            language: v-cel
+            source: '{"customer_id": profile_context.customer_id, "profile_version": profile_context.profile_version, "email": profile_context.email, "segment": profile_context.segment}'
+      output_variable: mongo_profile
+
+    - id: index_elastic_profile
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.elastic
+        operation: index
+      input_mappings:
+        - target: index
+          source: { language: spv1, source: "$.profile_context.search_index" }
+        - target: id
+          source: { language: spv1, source: "$.profile_context.customer_id" }
+        - target: document
+          source:
+            language: v-cel
+            source: '{"customer_id": profile_context.customer_id, "email": profile_context.email, "segment": profile_context.segment}'
+      output_variable: elastic_profile
+
+    - id: update_neo4j_customer_node
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.neo4j
+        operation: query
+      input_mappings:
+        - target: cypher
+          source:
+            language: v-cel
+            source: '"MERGE (c:Customer {customer_id: \"" + profile_context.customer_id + "\"}) SET c.email = \"" + profile_context.email + "\", c.segment = \"" + profile_context.segment + "\""'
+      output_variable: neo4j_profile
+
+    - id: write_dynamodb_projection
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.dynamodb
+        operation: put_item
+      input_mappings:
+        - target: table
+          source: { language: literal, source: "customer_profile_projection" }
+        - target: item
+          source:
+            language: v-cel
+            source: '{"customer_id": profile_context.customer_id, "profile_version": profile_context.profile_version, "email": profile_context.email, "segment": profile_context.segment}'
+      output_variable: dynamodb_projection
+
+    - id: accepted_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"status": "projection-declared", "customer_id": profile_context.customer_id, "profile_version": profile_context.profile_version, "backend_families": ["postgres", "mysql", "yugabyte", "mongo", "elastic", "neo4j", "dynamodb"]}'
+      output_variable: final_response
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.final_response" }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: validate_profile } }
+    - { id: f02, from: { node: validate_profile }, to: { node: normalize_profile } }
+    - { id: f03, from: { node: normalize_profile }, to: { node: upsert_postgres_primary } }
+    - { id: f04, from: { node: upsert_postgres_primary }, to: { node: mirror_mysql_read_model } }
+    - { id: f05, from: { node: mirror_mysql_read_model }, to: { node: mirror_yugabyte_geo_index } }
+    - { id: f06, from: { node: mirror_yugabyte_geo_index }, to: { node: write_mongo_profile_doc } }
+    - { id: f07, from: { node: write_mongo_profile_doc }, to: { node: index_elastic_profile } }
+    - { id: f08, from: { node: index_elastic_profile }, to: { node: update_neo4j_customer_node } }
+    - { id: f09, from: { node: update_neo4j_customer_node }, to: { node: write_dynamodb_projection } }
+    - { id: f10, from: { node: write_dynamodb_projection }, to: { node: accepted_response } }
+    - { id: f11, from: { node: accepted_response }, to: { node: respond } }
+    - { id: f12, from: { node: respond }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: profile_context, type: object }
+    - { name: final_response, type: object }

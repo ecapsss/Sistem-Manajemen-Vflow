@@ -1,0 +1,168 @@
+version: "3.0"
+metadata:
+  id: audit-observability-timeline
+  name: "Audit Observability Timeline"
+  description: |
+    Incident response workflow that demonstrates user-owned audit_log
+    channels and operator timeline ingredients. Runtime console merges these
+    audit envelopes with statestore events, checkpoints, cancel/retry actions,
+    and HumanTask/EventGateway park state.
+  dialect: vflow
+  tags: [example, p1, audit, observability, timeline]
+  audit_log:
+    compliance_log:
+      enabled: true
+      schema_version: "1.0"
+      sink_ref: "pack://runtime-observability/compliance"
+      subject: "examples.audit.compliance.workflow.v1"
+      on: [workflow_started, workflow_succeeded, workflow_failed]
+      emit_mode: async_durable
+      data_classification: { contains_pii: true, legal_basis: "incident response audit" }
+      delivery:
+        ack_policy: at_least_once
+        retry_policy: { max_attempts: 5, backoff: exponential, initial_delay_ms: 100, max_delay_ms: 3000 }
+        dlq_ref: "pack://runtime-observability/audit-dlq"
+      retention: "2555d"
+    trace_log:
+      enabled: true
+      schema_version: "1.0"
+      sink_ref: "pack://runtime-observability/trace"
+      subject: "examples.audit.trace.activity.v1"
+      on: [activity_succeeded, activity_failed]
+      emit_mode: async
+    business_events:
+      enabled: true
+      schema_version: "1.0"
+      sink_ref: "pack://runtime-observability/events"
+      subject: "examples.audit.business.workflow.v1"
+      on: [workflow_succeeded]
+      emit_mode: async
+
+spec:
+  durability:
+    enabled: true
+    default_mode: journal-state
+
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        route: /examples/audit/incidents
+        webhook_config: { path: /examples/audit/incidents, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: validate_incident
+      activity_type: Validate
+      audit_log:
+        enabled: true
+        schema_version: "1.0"
+        sink_ref: "pack://runtime-observability/activity-trace"
+        subject: "examples.audit.validation.activity.v1"
+        on: [activity_succeeded, activity_failed]
+        emit_mode: async
+      validate_config:
+        input: "$.trigger_payload.body"
+        schema:
+          required: [incident_id, service, severity, summary]
+          properties:
+            incident_id: { type: string, min_length: 3 }
+            service: { type: string, min_length: 2 }
+            severity: { type: string, min_length: 2 }
+            summary: { type: string, min_length: 5 }
+      output_variable: validated_incident
+
+    - id: classify_incident
+      activity_type: Transform
+      input_mappings:
+        - target: incident
+          source:
+            language: v-cel
+            source: '{"incident_id": trigger_payload.body.incident_id, "service": trigger_payload.body.service, "severity": trigger_payload.body.severity, "summary": trigger_payload.body.summary, "major": trigger_payload.body.severity in ["sev1", "sev2"], "timeline_expectation": "statestore events + checkpoints + audit envelopes + park state"}'
+      output_variable: incident_context
+
+    - id: escalation_gate
+      activity_type: Exclusive
+
+    - id: operator_review
+      activity_type: HumanTask
+      persistence: ssot
+      human_task_config:
+        task_type: incident-escalation-review
+        assignee: sre_lead
+        candidate_groups: [sre, incident_command]
+        title: "Major incident escalation review"
+        description: "Confirm customer impact, mitigation owner, and communication plan."
+        form_ref: incident-escalation-form-v1
+        priority: 95
+      input_mappings:
+        - target: incident
+          source: { language: spv1, source: "$.incident_context" }
+      output_variable: review_result
+
+    - id: wait_mitigation_signal
+      activity_type: EventGateway
+      persistence: ssot
+      event_gateway_config:
+        await: [mitigation-started, mitigation-rejected]
+        timeout_ms: 120000
+
+    - id: notify_pager
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+        timeout_ms: 3000
+        retry_policy:
+          max_attempts: 2
+          base_delay_ms: 250
+          max_delay_ms: 1000
+          backoff_factor: 2.0
+      input_mappings:
+        - target: url
+          source: { language: literal, source: "http://127.0.0.1:18030/incidents/page" }
+        - target: body
+          source:
+            language: v-cel
+            source: '{"incident_id": incident_context.incident_id, "service": incident_context.service, "severity": incident_context.severity}'
+      output_variable: pager_result
+
+    - id: accepted_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"status": incident_context.major ? "escalated" : "accepted", "incident_id": incident_context.incident_id, "timeline": incident_context.timeline_expectation}'
+      output_variable: final_response
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.final_response" }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: validate_incident } }
+    - { id: f02, from: { node: validate_incident }, to: { node: classify_incident } }
+    - { id: f03, from: { node: classify_incident }, to: { node: escalation_gate } }
+    - { id: f04, from: { node: escalation_gate }, to: { node: operator_review }, condition: "incident_context.major", priority: 20 }
+    - { id: f05, from: { node: escalation_gate }, to: { node: notify_pager }, type: default, priority: 0 }
+    - { id: f06, from: { node: operator_review }, to: { node: wait_mitigation_signal } }
+    - { id: f07, from: { node: wait_mitigation_signal }, to: { node: notify_pager }, condition: '_last_output.event == "mitigation-started"', priority: 10 }
+    - { id: f08, type: error, from: { node: wait_mitigation_signal }, to: { node: accepted_response } }
+    - { id: f09, from: { node: notify_pager }, to: { node: accepted_response } }
+    - { id: f10, from: { node: accepted_response }, to: { node: respond } }
+    - { id: f11, from: { node: respond }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: incident_context, type: object }
+    - { name: review_result, type: object }
+    - { name: final_response, type: object }

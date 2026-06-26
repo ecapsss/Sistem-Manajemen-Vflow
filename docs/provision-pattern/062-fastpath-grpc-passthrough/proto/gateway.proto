@@ -1,0 +1,21 @@
+// Pure gRPC passthrough — request bytes returned as response, no
+// transformation. Baseline ceiling test for vflow gRPC fastpath: the
+// minimum cost vflow can pay per request when zero compute work is
+// performed. Subtract from 061 to isolate V-Rule eval cost.
+
+syntax = "proto3";
+
+package examples;
+
+service Gateway {
+  // Passthrough: request bytes returned verbatim as the response.
+  // Same message type both ways, so the trigger-body bytes are valid
+  // response wire bytes without re-encoding.
+  rpc Passthrough(GatewayMessage) returns (GatewayMessage);
+}
+
+message GatewayMessage {
+  string tenant_id = 1;
+  string trace_id  = 2;
+  string payload   = 3;
+}

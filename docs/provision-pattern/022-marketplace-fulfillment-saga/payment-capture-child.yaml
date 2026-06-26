@@ -1,0 +1,57 @@
+version: "3.0"
+metadata:
+  id: marketplace-payment-capture-child
+  name: "Marketplace Payment Capture Child"
+  description: |
+    Child workflow used by the marketplace fulfillment saga. Captures payment
+    through a local mock rail and returns the capture result to the parent
+    SubWorkflow call.
+  dialect: vflow
+  tags: [example, p0, marketplace, subworkflow, payment]
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        route: /examples/marketplace/internal/payment-capture
+        webhook_config: { path: /examples/marketplace/internal/payment-capture, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: capture_payment
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+        timeout_ms: 3000
+        retry_policy:
+          max_attempts: 2
+          base_delay_ms: 200
+          max_delay_ms: 1000
+          backoff_factor: 2.0
+      input_mappings:
+        - target: url
+          source: { language: literal, source: "http://127.0.0.1:18022/payments/capture" }
+        - target: body
+          source:
+            language: v-cel
+            source: '{"checkout_id": trigger_payload.body.checkout_id, "idempotency_key": trigger_payload.body.idempotency_key, "amount": trigger_payload.body.amount, "currency": trigger_payload.body.currency}'
+      output_variable: payment_capture
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.payment_capture" }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: capture_payment } }
+    - { id: f02, from: { node: capture_payment }, to: { node: respond } }
+    - { id: f03, from: { node: respond }, to: { node: end } }

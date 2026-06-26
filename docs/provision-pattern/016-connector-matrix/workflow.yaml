@@ -1,0 +1,231 @@
+version: "3.0"
+metadata:
+  id: connector-matrix
+  name: "P0 Connector matrix"
+  description: |
+    Compile-time contract for connector declaration shapes. Runtime execution
+    of infra-backed connectors is intentionally skip-aware and belongs in
+    local/lab smoke scripts. Trigger-gated connectors stay documented as
+    trigger-gated in the audit and are not claimed as default E2E local.
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        webhook_config: { path: /examples/connectors, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: http_get
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.http
+        operation: get
+      input_mappings:
+        - target: url
+          source: { language: literal, source: "http://127.0.0.1:18080/health" }
+      output_variable: http_result
+
+    - id: grpc_health
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.grpc
+        operation: health_check
+        config:
+          endpoint: "http://127.0.0.1:50051"
+          service: "cell-agent"
+      output_variable: grpc_result
+
+    - id: sqlite_pack_query
+      activity_type: Connector
+      connector_config:
+        connector_ref: "pack://examples/hello-db/primary"
+        operation: raw_query
+      input_mappings:
+        - target: query
+          source: { language: literal, source: "select 'hello' as message" }
+      output_variable: sqlite_result
+
+    - id: nats_publish
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.nats
+        operation: publish
+      input_mappings:
+        - target: subject
+          source: { language: literal, source: "examples.connector.matrix" }
+        - target: payload
+          source: { language: literal, source: '{"ok":true}' }
+      output_variable: nats_result
+
+    - id: redis_counter
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.redis
+        operation: incr
+      input_mappings:
+        - target: key
+          source: { language: literal, source: "examples:connector:matrix" }
+      output_variable: redis_result
+
+    - id: clickhouse_ping
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.clickhouse
+        operation: ping
+      output_variable: clickhouse_result
+
+    - id: cassandra_raw_query
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.cassandra
+        operation: raw_query
+      input_mappings:
+        - target: query
+          source: { language: literal, source: "select now() from system.local" }
+      output_variable: cassandra_result
+
+    - id: timeseries_ping
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.timeseries
+        operation: ping
+      output_variable: timeseries_result
+
+    - id: etcd_put
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.etcd
+        operation: put
+      input_mappings:
+        - target: key
+          source: { language: literal, source: "/vflow/examples/connector-matrix" }
+        - target: value
+          source: { language: literal, source: "ok" }
+      output_variable: etcd_result
+
+    - id: s3_put_object
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.s3
+        operation: put_object
+      input_mappings:
+        - target: key
+          source: { language: literal, source: "examples/connector-matrix.json" }
+        - target: body
+          source: { language: literal, source: '{"ok":true}' }
+      output_variable: s3_result
+
+    - id: sftp_list
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.sftp
+        operation: list
+      input_mappings:
+        - target: path
+          source: { language: literal, source: "/inbox" }
+      output_variable: sftp_result
+
+    - id: websocket_broadcast
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.websocket
+        operation: broadcast
+      input_mappings:
+        - target: topic
+          source: { language: literal, source: "examples.connector.matrix" }
+        - target: message
+          source: { language: literal, source: '{"ok":true}' }
+      output_variable: websocket_result
+
+    - id: soap_call
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.soap
+        operation: call_action
+      input_mappings:
+        - target: action
+          source: { language: literal, source: "urn:examples:Ping" }
+        - target: namespace
+          source: { language: literal, source: "urn:examples" }
+        - target: body
+          source: { language: literal, source: "<Ping/>" }
+      output_variable: soap_result
+
+    - id: protobuf_encode
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.protobuf
+        operation: encode
+      input_mappings:
+        - target: schema
+          source:
+            language: literal
+            source: '{"name":"Example","fields":[{"name":"id","number":1,"type":"string"}]}'
+        - target: data
+          source: { language: literal, source: '{"id":"ex-1"}' }
+      output_variable: protobuf_result
+
+    - id: msgpack_encode
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.msgpack
+        operation: encode
+      input_mappings:
+        - target: value
+          source: { language: literal, source: '{"id":"ex-1","ok":true}' }
+      output_variable: msgpack_result
+
+    - id: fixedwidth_parse
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.parse_fixedwidth
+        operation: parse
+      input_mappings:
+        - target: raw_data
+          source: { language: literal, source: "HD20260501BANK000002" }
+        - target: schema
+          source:
+            language: literal
+            source:
+              record_type: header
+              fields:
+                - { name: record_type, start: 0, length: 2, type: string }
+                - { name: report_date, start: 2, length: 8, type: date }
+                - { name: bank_code, start: 10, length: 4, type: string }
+                - { name: total_records, start: 14, length: 6, type: integer }
+      output_variable: fixedwidth_result
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response:
+          language: literal
+          source: '{"connector_matrix":"compiled"}'
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: http_get } }
+    - { id: f02, from: { node: http_get }, to: { node: grpc_health } }
+    - { id: f03, from: { node: grpc_health }, to: { node: sqlite_pack_query } }
+    - { id: f04, from: { node: sqlite_pack_query }, to: { node: nats_publish } }
+    - { id: f05, from: { node: nats_publish }, to: { node: redis_counter } }
+    - { id: f06, from: { node: redis_counter }, to: { node: clickhouse_ping } }
+    - { id: f07, from: { node: clickhouse_ping }, to: { node: cassandra_raw_query } }
+    - { id: f08, from: { node: cassandra_raw_query }, to: { node: timeseries_ping } }
+    - { id: f09, from: { node: timeseries_ping }, to: { node: etcd_put } }
+    - { id: f10, from: { node: etcd_put }, to: { node: s3_put_object } }
+    - { id: f11, from: { node: s3_put_object }, to: { node: sftp_list } }
+    - { id: f12, from: { node: sftp_list }, to: { node: websocket_broadcast } }
+    - { id: f13, from: { node: websocket_broadcast }, to: { node: soap_call } }
+    - { id: f14, from: { node: soap_call }, to: { node: protobuf_encode } }
+    - { id: f15, from: { node: protobuf_encode }, to: { node: msgpack_encode } }
+    - { id: f16, from: { node: msgpack_encode }, to: { node: fixedwidth_parse } }
+    - { id: f17, from: { node: fixedwidth_parse }, to: { node: respond } }
+    - { id: f18, from: { node: respond }, to: { node: end } }

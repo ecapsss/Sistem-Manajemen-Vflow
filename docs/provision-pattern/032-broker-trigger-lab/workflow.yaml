@@ -1,0 +1,191 @@
+version: "3.0"
+metadata:
+  id: broker-trigger-lab
+  name: "Broker Trigger Lab"
+  description: |
+    Broker trigger and fanout lab for provider-backed event infrastructure.
+    Kafka and MQTT are typed trigger declarations in current VWFD. RabbitMQ,
+    Pulsar, Pub/Sub, and SQS are connector-side fanout contracts until their
+    trigger adapters are added to the runtime trigger schema.
+  dialect: vflow
+  tags: [example, p2, brokers, triggers, failure-semantics]
+
+spec:
+  durability:
+    enabled: true
+    default_mode: journal-state
+
+  activities:
+    - id: kafka_order_event
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: kafka
+        route: /examples/brokers/kafka/orders
+        kafka:
+          brokers: "localhost:9092"
+          topics: ["examples.brokers.orders"]
+          group_id: "vflow-examples-broker-lab"
+        filter: "event.body != null"
+      output_variable: trigger_payload
+
+    - id: mqtt_order_event
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: mqtt
+        route: /examples/brokers/mqtt/orders
+        mqtt:
+          url: "mqtt://localhost:1883"
+          topic: "examples/brokers/orders"
+        filter: "event.body != null"
+      output_variable: trigger_payload
+
+    - id: webhook_lab_event
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        route: /examples/brokers/lab
+        webhook_config: { path: /examples/brokers/lab, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: validate_broker_event
+      activity_type: Validate
+      validate_config:
+        input: "$.trigger_payload.body"
+        schema:
+          required: [event_id, order_id, tenant_id, idempotency_key]
+          properties:
+            event_id: { type: string, min_length: 4 }
+            order_id: { type: string, min_length: 3 }
+            tenant_id: { type: string, min_length: 3 }
+            idempotency_key: { type: string, min_length: 8 }
+      output_variable: validated_event
+
+    - id: normalize_broker_event
+      activity_type: Transform
+      annotations:
+        failure_semantics:
+          idempotency_key: "$.trigger_payload.body.idempotency_key"
+          retryable_classes: [connection, timeout, throttled]
+          non_retryable_classes: [schema, auth, permission, duplicate_without_idempotency]
+      input_mappings:
+        - target: broker_context
+          source:
+            language: v-cel
+            source: '{"event_id": trigger_payload.body.event_id, "order_id": trigger_payload.body.order_id, "tenant_id": trigger_payload.body.tenant_id, "idempotency_key": trigger_payload.body.idempotency_key, "event_type": "order.accepted", "payload": {"event_id": trigger_payload.body.event_id, "order_id": trigger_payload.body.order_id, "tenant_id": trigger_payload.body.tenant_id}}'
+      output_variable: broker_context
+
+    - id: publish_kafka
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.kafka
+        operation: publish
+      input_mappings:
+        - target: topic
+          source: { language: literal, source: "examples.brokers.orders.accepted" }
+        - target: payload
+          source: { language: spv1, source: "$.broker_context.payload" }
+      output_variable: kafka_publish
+
+    - id: publish_mqtt
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.mqtt
+        operation: publish
+      input_mappings:
+        - target: topic
+          source: { language: literal, source: "examples/brokers/orders/accepted" }
+        - target: payload
+          source: { language: spv1, source: "$.broker_context.payload" }
+      output_variable: mqtt_publish
+
+    - id: publish_rabbitmq
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.rabbitmq
+        operation: publish
+      input_mappings:
+        - target: exchange
+          source: { language: literal, source: "examples.brokers" }
+        - target: routing_key
+          source: { language: literal, source: "orders.accepted" }
+        - target: payload
+          source: { language: spv1, source: "$.broker_context.payload" }
+      output_variable: rabbitmq_publish
+
+    - id: publish_pulsar
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.pulsar
+        operation: publish
+      input_mappings:
+        - target: payload
+          source: { language: spv1, source: "$.broker_context.payload" }
+      output_variable: pulsar_publish
+
+    - id: publish_pubsub
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.pubsub
+        operation: publish
+      input_mappings:
+        - target: topic
+          source: { language: literal, source: "examples-brokers-orders-accepted" }
+        - target: payload
+          source: { language: spv1, source: "$.broker_context.payload" }
+      output_variable: pubsub_publish
+
+    - id: send_sqs
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.sqs
+        operation: send
+      input_mappings:
+        - target: body
+          source: { language: spv1, source: "$.broker_context.payload" }
+      output_variable: sqs_send
+
+    - id: accepted_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"status": "fanout-declared", "event_id": broker_context.event_id, "order_id": broker_context.order_id, "broker_families": ["kafka", "mqtt", "rabbitmq", "pulsar", "pubsub", "sqs"]}'
+      output_variable: final_response
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: webhook_lab_event
+        final_response: { language: spv1, source: "$.final_response" }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: kafka_order_event }, to: { node: validate_broker_event } }
+    - { id: f02, from: { node: mqtt_order_event }, to: { node: validate_broker_event } }
+    - { id: f03, from: { node: webhook_lab_event }, to: { node: validate_broker_event } }
+    - { id: f04, from: { node: validate_broker_event }, to: { node: normalize_broker_event } }
+    - { id: f05, from: { node: normalize_broker_event }, to: { node: publish_kafka } }
+    - { id: f06, from: { node: publish_kafka }, to: { node: publish_mqtt } }
+    - { id: f07, from: { node: publish_mqtt }, to: { node: publish_rabbitmq } }
+    - { id: f08, from: { node: publish_rabbitmq }, to: { node: publish_pulsar } }
+    - { id: f09, from: { node: publish_pulsar }, to: { node: publish_pubsub } }
+    - { id: f10, from: { node: publish_pubsub }, to: { node: send_sqs } }
+    - { id: f11, from: { node: send_sqs }, to: { node: accepted_response } }
+    - { id: f12, from: { node: accepted_response }, to: { node: respond } }
+    - { id: f13, from: { node: respond }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: broker_context, type: object }
+    - { name: final_response, type: object }

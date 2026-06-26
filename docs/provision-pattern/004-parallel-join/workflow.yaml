@@ -1,0 +1,62 @@
+version: "3.0"
+metadata:
+  id: parallel-enrich
+  name: "Parallel Data Enrichment"
+  # VFlow-exclusive: Parallel fork + Join barrier
+  # Fires enrich_credit and enrich_fraud concurrently, Join waits for both
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        webhook_config: { path: /api/enrich, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+    - id: fork
+      activity_type: Parallel
+      parallel_config: { mode: all }
+    - id: enrich_credit
+      activity_type: Connector
+      persistence: ssot         # P4.20: credit bureau response is authoritative
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+      input_mappings:
+        - target: url
+          source: { language: literal, source: "http://credit-bureau/api/check" }
+        - target: body
+          source: { language: v-cel, source: 'trigger_payload.body' }
+      output_variable: credit_result
+    - id: enrich_fraud
+      activity_type: Connector
+      persistence: ssot         # P4.20: fraud score is billable; don't re-call on resume
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+      input_mappings:
+        - target: url
+          source: { language: literal, source: "http://fraud-service/api/score" }
+        - target: body
+          source: { language: v-cel, source: 'trigger_payload.body' }
+      output_variable: fraud_result
+    - id: join
+      activity_type: Join
+      join_config: { mode: wait_all }
+      output_variable: merged
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: v-cel, source: 'merged' }
+    - id: end
+      activity_type: End
+  flows:
+    - { id: f1, from: { node: trigger }, to: { node: fork } }
+    - { id: f2, from: { node: fork }, to: { node: enrich_credit } }
+    - { id: f3, from: { node: fork }, to: { node: enrich_fraud } }
+    - { id: f4, from: { node: enrich_credit }, to: { node: join } }
+    - { id: f5, from: { node: enrich_fraud }, to: { node: join } }
+    - { id: f6, from: { node: join }, to: { node: respond } }
+    - { id: f7, from: { node: respond }, to: { node: end } }

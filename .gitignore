@@ -1,0 +1,30 @@
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+!.env.logstream
+
+# Admin/provision payloads generated on each machine
+pack-install.local.json
+pack-install.*.local.json
+*.secret.json
+*.secrets.json
+
+# Tunnel client configs are distributed manually per group
+kel*-client.toml
+*rathole*client*.toml
+
+# Local database artifacts
+*.dump
+*.backup
+*.sql.gz
+*.sqlite
+*.sqlite3
+
+# Logs and temporary files
+*.log
+logs/
+tmp/
+
+# Optional low-risk logstream token file, allowed if intentionally committed
+!logstream-token.txt

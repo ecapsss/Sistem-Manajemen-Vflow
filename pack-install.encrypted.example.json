@@ -1,0 +1,12 @@
+{
+  "pack_yaml": "pack:\n  id: kelompok3-umkm\n  version: 0.1.0\n  description: Connection-only pack for Kelompok 3 UMKM upstream services.\nconnections:\n  - name: primary\n    kind: postgres\n    url: env://KELOMPOK3_DATABASE_URL\n    pool:\n      max_size: 5\n      min_idle: 1\n      acquire_timeout_ms: 3000\n      idle_timeout_ms: 30000\nworkflows: []\n",
+  "encrypted_secrets": {
+    "KELOMPOK3_DATABASE_URL": {
+      "alg": "A256GCM",
+      "nonce_b64": "REPLACE_WITH_NONCE_BASE64",
+      "ciphertext_b64": "REPLACE_WITH_CIPHERTEXT_BASE64"
+    }
+  },
+  "replace": true,
+  "tenant": "_default"
+}

@@ -1,0 +1,158 @@
+version: "3.0"
+metadata:
+  id: kelompok3-umkm-kalkulasi-tagihan
+  name: "UMKM - Kalkulasi Total Tagihan"
+  active: true
+  description: |
+    Workflow 3. Menghitung total pembayaran pelanggan secara otomatis
+    menggunakan VRule Engine (VDICL rule pack kelompok3_aturan_harga_umkm_v1).
+    Stateless decisioning -> fastpath runtime mode untuk latensi minimal
+    di titik checkout.
+  dialect: vflow
+  tags: [kelompok3, umkm, harga, vrule, vdicl, fastpath, p0]
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        runtime_mode: fastpath
+        webhook_config: { path: /webhook/kelompok3/umkm/pesanan/kalkulasi-tagihan, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: hitung_harga
+      activity_type: VRule
+      rule_config:
+        tenant_id: kelompok3
+        rule_set_id: kelompok3_aturan_harga_umkm_v1
+        version_policy: latest
+        eval_mode: bytecode
+      input_mappings:
+        - target: subtotal
+          source: { language: spv1, source: "$.trigger_payload.subtotal" }
+        - target: total_item
+          source: { language: spv1, source: "$.trigger_payload.total_item" }
+        - target: tipe_pelanggan
+          source: { language: spv1, source: "$.trigger_payload.tipe_pelanggan" }
+        - target: metode_pembayaran
+          source: { language: spv1, source: "$.trigger_payload.metode_pembayaran" }
+        - target: metode_pengambilan
+          source: { language: spv1, source: "$.trigger_payload.metode_pengambilan" }
+      output_variable: harga_result
+
+    # Transform v-cel: gabungkan output VRule (diskon, biaya_admin,
+    # biaya_pengiriman) menjadi total_tagihan akhir.
+    - id: hitung_total_akhir
+      activity_type: Compute
+      compute_config:
+        language: starlark
+        entry_fn: run
+        budget_profile: none
+        timeout_ms: 1000
+        source: |
+          def run(ctx):
+              harga = ctx.get("harga_result") or {}
+              trigger = ctx.get("trigger_payload") or {}
+              outputs = harga.get("outputs") or {}
+
+              def first(name):
+                  values = outputs.get(name) or [0]
+                  return values[0] if len(values) > 0 else 0
+
+              def max_value(name):
+                  values = outputs.get(name) or [0]
+                  result = values[0] if len(values) > 0 else 0
+                  for value in values:
+                      if value > result:
+                          result = value
+                  return result
+
+              diskon = max_value("diskon")
+              biaya_admin = first("biaya_admin")
+              biaya_pengiriman = first("biaya_pengiriman")
+              subtotal = trigger.get("subtotal") or 0
+
+              return {
+                  "response": {
+                      "total_tagihan": subtotal - diskon + biaya_admin + biaya_pengiriman,
+                      "diskon": diskon,
+                      "biaya_admin": biaya_admin,
+                      "biaya_pengiriman": biaya_pengiriman,
+                      "subtotal": subtotal,
+                      "findings": harga.get("findings") or [],
+                  }
+              }
+      input_mappings:
+        - target: harga_result
+          source: { language: spv1, source: "$.harga_result" }
+        - target: trigger_payload
+          source: { language: spv1, source: "$.trigger_payload" }
+      output_variable: final_response
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.final_response.response" }
+
+    # --- Detached branch (Workflow 6 - Audit Log) ---
+    # Tidak pernah memblokir respons checkout ke pelanggan. Dijadwalkan
+    # setelah response diemit (lihat 01-schema.md "Detached edges").
+    # Catatan: pesanan_id dan kasir_id BUKAN field wajib Workflow 3 (lihat
+    # Bab 5 spesifikasi - input resminya hanya subtotal, total_item,
+    # tipe_pelanggan, metode_pembayaran, metode_pengambilan). Backend
+    # Express/caller boleh menyertakannya secara opsional di body request
+    # supaya audit trail tertaut ke pesanan; jika tidak dikirim, gunakan
+    # fallback "unknown" agar Validate di Workflow 6 tidak menolak payload.
+    - id: build_audit_payload
+      activity_type: Transform
+      input_mappings:
+        - target: audit_payload
+          source:
+            language: v-cel
+            source: >-
+              {"pesanan_id": has(trigger_payload.pesanan_id) ? trigger_payload.pesanan_id : "unknown",
+               "aktor_id": has(trigger_payload.kasir_id) ? trigger_payload.kasir_id : "system",
+               "aktivitas_tipe": "KALKULASI_TAGIHAN",
+               "payload_log": final_response.response,
+               "waktu_kejadian": now()}
+      output_variable: audit_payload
+
+    - id: call_audit_log
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+        timeout_ms: 2000
+      input_mappings:
+        - target: url
+          # Loopback hanya dipakai untuk self-call workflow lain di VFlow server ini.
+          # Path memakai namespace kelompok3 agar tidak tabrakan.
+          source: { language: literal, source: "http://127.0.0.1:47800/webhook/kelompok3/umkm/internal/audit-log" }
+        - target: body
+          source: { language: spv1, source: "$.audit_payload" }
+      output_variable: audit_call_result
+
+    - id: audit_end
+      activity_type: End
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: hitung_harga } }
+    - { id: f02, from: { node: hitung_harga }, to: { node: hitung_total_akhir } }
+    - { id: f03, from: { node: hitung_total_akhir }, to: { node: respond } }
+    - { id: f04, from: { node: respond }, to: { node: end } }
+    - { id: f05, from: { node: hitung_total_akhir }, to: { node: build_audit_payload }, detached: true }
+    - { id: f06, from: { node: build_audit_payload }, to: { node: call_audit_log } }
+    - { id: f07, from: { node: call_audit_log }, to: { node: audit_end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: harga_result, type: object }
+    - { name: final_response, type: object }
+    - { name: audit_payload, type: object }

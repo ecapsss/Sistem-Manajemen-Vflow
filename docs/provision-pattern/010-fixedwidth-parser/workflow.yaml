@@ -1,0 +1,92 @@
+version: "3.0"
+metadata:
+  id: slik-parser
+  name: "Fixed-Width Parser — SLIK/OJK Banking Format"
+  # VFlow-exclusive: vil_parse_fixedwidth connector for legacy banking formats
+  # SLIK = Sistem Layanan Informasi Keuangan (OJK credit bureau)
+  # Fixed-width records: positions define fields, no delimiters
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        webhook_config: { path: /api/slik/parse, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+    - id: parse_header
+      activity_type: Connector
+      persistence: skip         # P4.20: pure deterministic parse — recompute free
+      connector_config:
+        connector_ref: vastar.parse_fixedwidth
+        operation: parse
+      input_mappings:
+        - target: raw_data
+          source: { language: v-cel, source: 'trigger_payload.body.raw_content' }
+        - target: schema
+          source:
+            language: literal
+            source:
+              record_type: header
+              encoding: "ISO-8859-1"
+              fields:
+                - { name: record_type, start: 0, length: 2, type: string }
+                - { name: report_date, start: 2, length: 8, type: date, format: "YYYYMMDD" }
+                - { name: bank_code, start: 10, length: 4, type: string }
+                - { name: total_records, start: 14, length: 6, type: integer, padding: zero }
+      output_variable: header
+    - id: parse_detail
+      activity_type: Connector
+      persistence: skip         # P4.20: pure deterministic batch parse — recompute free
+      connector_config:
+        connector_ref: vastar.parse_fixedwidth
+        operation: parse_batch
+      input_mappings:
+        - target: raw_data
+          source: { language: v-cel, source: 'trigger_payload.body.raw_content' }
+        - target: skip_lines
+          source: { language: literal, source: 1 }
+        - target: schema
+          source:
+            language: literal
+            source:
+              record_type: detail
+              encoding: "ISO-8859-1"
+              fields:
+                - { name: record_type, start: 0, length: 2, type: string }
+                - { name: nik, start: 2, length: 16, type: string }
+                - { name: full_name, start: 18, length: 50, type: string, trim: right }
+                - { name: credit_limit, start: 68, length: 15, type: decimal, scale: 2, padding: zero }
+                - { name: outstanding, start: 83, length: 15, type: decimal, scale: 2, padding: zero }
+                - { name: collectability, start: 98, length: 1, type: integer }
+                - { name: last_payment_date, start: 99, length: 8, type: date, format: "YYYYMMDD" }
+      output_variable: details
+    - id: enrich
+      activity_type: Transform
+      input_mappings:
+        - target: report
+          source:
+            language: v-cel
+            source: |
+              {
+                "header": header,
+                "record_count": details.records.size(),
+                "total_outstanding": details.records.map(r, r.outstanding).sum(),
+                "high_risk": details.records.filter(r, r.collectability >= 3),
+                "parsed_at": timestamp(now)
+              }
+      output_variable: enriched
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: v-cel, source: 'enriched.report' }
+    - id: end
+      activity_type: End
+  flows:
+    - { id: f1, from: { node: trigger }, to: { node: parse_header } }
+    - { id: f2, from: { node: parse_header }, to: { node: parse_detail } }
+    - { id: f3, from: { node: parse_detail }, to: { node: enrich } }
+    - { id: f4, from: { node: enrich }, to: { node: respond } }
+    - { id: f5, from: { node: respond }, to: { node: end } }

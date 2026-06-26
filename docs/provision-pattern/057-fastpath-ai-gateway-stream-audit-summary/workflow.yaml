@@ -1,0 +1,71 @@
+version: "3.0"
+metadata:
+  id: fastpath-ai-gateway-stream-audit-summary
+  name: "Fastpath AI Gateway Stream Audit Summary"
+  description: "AI gateway streaming path with one request-level audit envelope and bounded stream counters."
+  audit_log:
+    enabled: true
+    schema_version: "1.0"
+    sink_ref: "pack://examples/risk-bench-audit/audit_nats"
+    subject: "bench.ai_gateway.audit.fastpath.request.v1"
+    on: [workflow_succeeded, workflow_failed]
+    emit_mode: async
+    extras:
+      event_type: { language: literal, source: "ai_gateway_stream" }
+      mode: { language: literal, source: "fastpath_stream_audit_summary" }
+      audit_status: { language: spv1, source: "$._audit.status" }
+      audit_bytes_in: { language: spv1, source: "$._audit.bytes_in" }
+      audit_bytes_out: { language: spv1, source: "$._audit.bytes_out" }
+      audit_chunks_out: { language: spv1, source: "$._audit.chunks_out" }
+      audit_duration_ms: { language: spv1, source: "$._audit.duration_ms" }
+      route: { language: spv1, source: "$._path" }
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        runtime_mode: fastpath
+        webhook_config:
+          path: /api/gw/stream-audit-log
+          method: POST
+        response_framing: chunked
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: call_simulator
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+        streaming: true
+        dialect: openai
+        json_tap: "choices[0].delta.content"
+        timeout_ms: 30000
+      input_mappings:
+        - target: url
+          source:
+            language: literal
+            source: "http://127.0.0.1:4545/v1/chat/completions"
+        - target: body
+          source:
+            language: literal
+            source: '{"model":"gpt-4","messages":[{"role":"user","content":"Benchmark performance test via VIL"}],"stream":true}'
+      output_variable: llm_result
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response:
+          language: v-cel
+          source: '{"content": llm_result.content}'
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f1, from: { node: trigger }, to: { node: call_simulator } }
+    - { id: f2, from: { node: call_simulator }, to: { node: respond } }
+    - { id: f3, from: { node: respond }, to: { node: end } }

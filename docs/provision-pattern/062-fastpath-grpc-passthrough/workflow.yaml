@@ -1,0 +1,68 @@
+version: "3.0"
+metadata:
+  id: fastpath-grpc-passthrough
+  name: "Fastpath gRPC Passthrough Gateway"
+  description: |
+    Pure gRPC passthrough — Trigger → EndTrigger → End. No compute,
+    no transformation. The request bytes received by the trigger are
+    written back verbatim as the response via `bytes_ref` reading the
+    `trigger_body` handle slot.
+
+    This is the **baseline ceiling test** for vflow gRPC fastpath:
+    measures the minimum cost vflow imposes on a request that does
+    zero business work. Subtracting 062 RPS from 061 RPS isolates the
+    V-Rule eval cost (6-mapping risk decision) on the gRPC path.
+
+    Architectural notes:
+      - `body_schema` is set so the fastpath plan-builder resolves
+        the proto descriptor and promotes `trigger_body` to a
+        `ProtoHandle` at request time. The `ProtoHandle` mirrors the
+        unframed gRPC body bytes into the variable's handle slot,
+        which `bytes_ref` then reads at EndTrigger.
+      - Request and response use the **same** message type
+        (`GatewayMessage`), so the bytes are valid on the wire in both
+        directions — no re-encode needed. The gRPC adapter only
+        re-frames (1-byte compression flag + 4-byte length prefix +
+        body).
+      - Inline no-spawn dispatch (gRPC adapter awaits `execute_trigger`
+        directly, no tokio mpsc hop) applies here as in 061.
+
+  dialect: vflow
+  tags: [example, p0, grpc, passthrough, gateway, bench, fastpath, ceiling]
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: grpc
+        runtime_mode: fastpath
+        grpc:
+          service: "examples.Gateway"
+          method: "Passthrough"
+          body_schema: "examples.GatewayMessage"
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        # `bytes_ref` reads the unframed gRPC body bytes from the
+        # `trigger_body` handle slot. Those bytes are a valid wire
+        # encoding of `examples.GatewayMessage`, so the gRPC adapter
+        # re-frames them as the response without re-encoding.
+        final_response:
+          language: bytes_ref
+          source: "trigger_body"
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f1, from: { node: trigger }, to: { node: respond } }
+    - { id: f2, from: { node: respond }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }

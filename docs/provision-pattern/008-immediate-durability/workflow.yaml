@@ -1,0 +1,90 @@
+version: "3.0"
+metadata:
+  id: payment-transfer
+  name: "Journal-State Durability — Bank Transfer"
+  # VFlow-exclusive: journal-state workflow mode + immediate critical steps.
+  # Runtime resolves the AES key via VFLOW_STATE_ENCRYPTION_KEY
+  # (VilVault/Vault/KMS/env/file handoff), not from the workflow YAML itself.
+  durability:
+    mode: journal-state
+    retention:
+      l2: 24h
+    storage:
+      compression: zstd
+      encryption: aes256
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        webhook_config: { path: /api/transfer, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+    - id: validate_input
+      activity_type: Transform
+      durability: non_durable
+      input_mappings:
+        - target: from_account
+          source: { language: v-cel, source: 'trigger_payload.body.from_account' }
+        - target: to_account
+          source: { language: v-cel, source: 'trigger_payload.body.to_account' }
+        - target: amount
+          source: { language: v-cel, source: 'trigger_payload.body.amount' }
+        - target: is_valid
+          source: { language: v-cel, source: 'trigger_payload.body.amount > 0 && trigger_payload.body.from_account != trigger_payload.body.to_account' }
+      output_variable: validated
+    - id: debit_source
+      activity_type: Connector
+      durability: immediate
+      persistence: full         # P4.20: debit is critical + irreversible — persist input+output
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+      input_mappings:
+        - target: url
+          source: { language: literal, source: "http://core-banking/api/debit" }
+        - target: body
+          source: { language: v-cel, source: '{"account": validated.from_account, "amount": validated.amount}' }
+      output_variable: debit_result
+    - id: credit_destination
+      activity_type: Connector
+      durability: immediate
+      persistence: full         # P4.20: credit side of transfer — persist input+output
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+      input_mappings:
+        - target: url
+          source: { language: literal, source: "http://core-banking/api/credit" }
+        - target: body
+          source: { language: v-cel, source: '{"account": validated.to_account, "amount": validated.amount}' }
+      output_variable: credit_result
+    - id: audit_log
+      activity_type: Connector
+      durability: immediate
+      persistence: ssot         # P4.20: audit receipt — stored verbatim, no re-call on resume
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+      input_mappings:
+        - target: url
+          source: { language: literal, source: "http://audit-service/api/log" }
+        - target: body
+          source: { language: v-cel, source: '{"from": validated.from_account, "to": validated.to_account, "amount": validated.amount, "debit_ref": debit_result.ref_id, "credit_ref": credit_result.ref_id}' }
+      output_variable: audit_result
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: v-cel, source: '{"status": "completed", "debit_ref": debit_result.ref_id, "credit_ref": credit_result.ref_id, "audit_id": audit_result.audit_id}' }
+    - id: end
+      activity_type: End
+  flows:
+    - { id: f1, from: { node: trigger }, to: { node: validate_input } }
+    - { id: f2, from: { node: validate_input }, to: { node: debit_source } }
+    - { id: f3, from: { node: debit_source }, to: { node: credit_destination } }
+    - { id: f4, from: { node: credit_destination }, to: { node: audit_log } }
+    - { id: f5, from: { node: audit_log }, to: { node: respond } }
+    - { id: f6, from: { node: respond }, to: { node: end } }

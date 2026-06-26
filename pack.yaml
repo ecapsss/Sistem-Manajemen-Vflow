@@ -1,0 +1,18 @@
+pack:
+  id: kelompok3-umkm
+  version: 0.1.0
+  description: >
+    Connection-only pack for Kelompok 3 UMKM upstream services. Workflows
+    reference the database through pack://kelompok3-umkm/primary.
+
+connections:
+  - name: primary
+    kind: postgres
+    url: env://KELOMPOK3_DATABASE_URL
+    pool:
+      max_size: 5
+      min_idle: 1
+      acquire_timeout_ms: 3000
+      idle_timeout_ms: 30000
+
+workflows: []

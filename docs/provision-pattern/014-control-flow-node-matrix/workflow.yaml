@@ -1,0 +1,111 @@
+version: "3.0"
+metadata:
+  id: control-flow-node-matrix
+  name: "P0 Control-flow node matrix"
+  description: |
+    Compile-time contract for public control-flow authoring nodes that were
+    previously listed as example gaps. This example intentionally keeps all
+    branches side-effect-free so it can stay in the default local runner.
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        webhook_config: { path: /examples/control-flow, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: extract
+      activity_type: Transform
+      input_mappings:
+        - target: amount
+          source: { language: spv1, source: '$.trigger_payload.body.amount' }
+        - target: items
+          source: { language: spv1, source: '$.trigger_payload.body.items' }
+        - target: approved_hint
+          source: { language: v-cel, source: 'amount >= 100' }
+      output_variable: extracted
+
+    - id: wait_window
+      activity_type: Timer
+      description: "Timer node shape; runtime policy decides actual wait semantics."
+
+    - id: control_passthrough
+      activity_type: Control
+      description: "Generic control node used when no split/join/gateway subtype is needed."
+
+    - id: decision
+      activity_type: Exclusive
+      description: "XOR gateway: first matching branch wins."
+
+    - id: fanout
+      activity_type: Inclusive
+      description: "OR gateway: every matching branch may continue."
+
+    - id: retry_window
+      activity_type: LoopWhile
+      loop_config:
+        condition: "amount > 0"
+        max_iterations: 2
+
+    - id: process_items
+      activity_type: LoopForEach
+      loop_config:
+        collection: "$.items"
+        item_variable: item
+        mode: sequential
+        max_iterations: 10
+
+    - id: repeat_audit
+      activity_type: LoopRepeat
+      loop_config:
+        repeat_count: 2
+        max_iterations: 2
+
+    - id: accepted
+      activity_type: Transform
+      input_mappings:
+        - target: result
+          source: { language: literal, source: "accepted" }
+      output_variable: result
+
+    - id: reviewed
+      activity_type: Transform
+      input_mappings:
+        - target: result
+          source: { language: literal, source: "reviewed" }
+      output_variable: result
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: '$.result' }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: extract } }
+    - { id: f02, from: { node: extract }, to: { node: wait_window } }
+    - { id: f03, from: { node: wait_window }, to: { node: control_passthrough } }
+    - { id: f04, from: { node: control_passthrough }, to: { node: decision } }
+    - { id: f05, from: { node: decision }, to: { node: fanout }, condition: "amount >= 100", priority: 20 }
+    - { id: f06, from: { node: decision }, to: { node: repeat_audit }, type: default, priority: 0 }
+    - { id: f07, from: { node: fanout }, to: { node: retry_window }, condition: "amount >= 100", priority: 20 }
+    - { id: f08, from: { node: fanout }, to: { node: process_items }, condition: "items != null", priority: 10 }
+    - { id: f09, from: { node: retry_window }, to: { node: process_items } }
+    - { id: f10, from: { node: process_items }, to: { node: accepted } }
+    - { id: f11, from: { node: repeat_audit }, to: { node: reviewed } }
+    - { id: f12, from: { node: accepted }, to: { node: respond } }
+    - { id: f13, from: { node: reviewed }, to: { node: respond } }
+    - { id: f14, from: { node: respond }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: amount, type: number }
+    - { name: items, type: array }
+    - { name: result, type: string }

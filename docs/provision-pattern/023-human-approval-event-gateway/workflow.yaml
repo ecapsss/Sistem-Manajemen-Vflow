@@ -1,0 +1,174 @@
+version: "3.0"
+metadata:
+  id: human-approval-event-gateway
+  name: "Human Approval Event Gateway"
+  description: |
+    High-value order review workflow. The runtime accepts an order, validates
+    and classifies it, parks on a HumanTask for an operator approval, waits for
+    an external fraud-cleared/fraud-rejected event, then returns the final
+    decision. This is user-runtime functionality and does not involve
+    vflow-cloud.
+  dialect: vflow
+  tags: [example, p0, humantask, eventgateway, signal, operator]
+
+spec:
+  durability:
+    enabled: true
+    default_mode: eventual
+
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        route: /examples/approval/orders
+        webhook_config: { path: /examples/approval/orders, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond-approved
+      output_variable: trigger_payload
+
+    - id: validate_order
+      activity_type: Validate
+      validate_config:
+        input: "$.trigger_payload.body"
+        schema:
+          required: [order_id, customer_id, currency, amount_cents, items]
+          properties:
+            order_id: { type: string, min_length: 3 }
+            customer_id: { type: string, min_length: 3 }
+            currency: { type: string, min_length: 3, max_length: 3 }
+            amount_cents: { type: integer, min: 1 }
+            items: { type: array, min: 1 }
+      output_variable: validated_order
+
+    - id: classify_order
+      activity_type: Transform
+      input_mappings:
+        - target: order
+          source:
+            language: v-cel
+            source: '{"order_id": trigger_payload.body.order_id, "customer_id": trigger_payload.body.customer_id, "currency": trigger_payload.body.currency, "amount_cents": trigger_payload.body.amount_cents, "items": trigger_payload.body.items, "approval_required": trigger_payload.body.amount_cents >= 5000000, "risk_reason": trigger_payload.body.amount_cents >= 5000000 ? "high_value_order" : "standard_order"}'
+      output_variable: order_context
+
+    - id: manual_review_gate
+      activity_type: Exclusive
+      description: "Only high-value orders park for operator approval."
+
+    - id: approval
+      activity_type: HumanTask
+      persistence: ssot
+      human_task_config:
+        task_type: order-approval
+        assignee: ops_approver
+        candidate_groups: [risk_ops]
+        title: "High-value order approval"
+        description: "Review customer, amount, and items before allowing fulfillment."
+        form_ref: order-approval-form-v1
+        priority: 90
+      input_mappings:
+        - target: order
+          source: { language: spv1, source: "$.order_context" }
+      output_variable: approval_result
+
+    - id: wait_fraud_event
+      activity_type: EventGateway
+      persistence: ssot
+      event_gateway_config:
+        await: [fraud-cleared, fraud-rejected]
+        timeout_ms: 60000
+
+    - id: cancel_rejected_order
+      activity_type: Signal
+      persistence: skip
+      signal_config:
+        signal_type: cancel
+        name: fraud-rejected-order
+
+    - id: approved_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"status": "approved", "order_id": order_context.order_id, "approval": approval_result.output, "fraud_event": "fraud-cleared", "operator_note": "HumanTask complete plus EventGateway resume"}'
+      output_variable: approved_response
+
+    - id: straight_through_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"status": "accepted", "order_id": order_context.order_id, "reason": order_context.risk_reason}'
+      output_variable: straight_through_response
+
+    - id: rejected_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"status": "rejected", "order_id": order_context.order_id, "reason": "operator_rejected_or_timed_out", "error": _error}'
+      output_variable: rejected_response
+
+    - id: invalid_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: literal
+            source: '{"status":"invalid","reason":"order payload failed validation"}'
+      output_variable: invalid_response
+
+    - id: respond-approved
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.approved_response" }
+
+    - id: respond-straight-through
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.straight_through_response" }
+
+    - id: respond-rejected
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.rejected_response" }
+
+    - id: respond-invalid
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.invalid_response" }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: validate_order } }
+    - { id: f02, from: { node: validate_order }, to: { node: classify_order } }
+    - { id: f03, from: { node: classify_order }, to: { node: manual_review_gate } }
+    - { id: f04, from: { node: manual_review_gate }, to: { node: approval }, condition: "order_context.amount_cents >= 5000000", priority: 10 }
+    - { id: f05, from: { node: manual_review_gate }, to: { node: straight_through_response }, type: default, priority: 100 }
+    - { id: f06, from: { node: approval }, to: { node: wait_fraud_event } }
+    - { id: f07, from: { node: wait_fraud_event }, to: { node: cancel_rejected_order }, condition: '_last_output.event == "fraud-rejected"', priority: 10 }
+    - { id: f08, from: { node: wait_fraud_event }, to: { node: approved_response }, condition: '_last_output.event == "fraud-cleared"', priority: 20 }
+    - { id: f09, type: error, from: { node: approval }, to: { node: rejected_response } }
+    - { id: f10, type: error, from: { node: validate_order }, to: { node: invalid_response } }
+    - { id: f11, from: { node: approved_response }, to: { node: respond-approved } }
+    - { id: f12, from: { node: straight_through_response }, to: { node: respond-straight-through } }
+    - { id: f13, from: { node: rejected_response }, to: { node: respond-rejected } }
+    - { id: f14, from: { node: invalid_response }, to: { node: respond-invalid } }
+    - { id: f15, from: { node: respond-approved }, to: { node: end } }
+    - { id: f16, from: { node: respond-straight-through }, to: { node: end } }
+    - { id: f17, from: { node: respond-rejected }, to: { node: end } }
+    - { id: f18, from: { node: respond-invalid }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: order_context, type: object }
+    - { name: approval_result, type: object }
+    - { name: approved_response, type: object }

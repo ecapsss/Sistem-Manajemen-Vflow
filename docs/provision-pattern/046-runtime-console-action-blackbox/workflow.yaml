@@ -1,0 +1,60 @@
+version: "3.0"
+metadata:
+  id: runtime-console-action-blackbox
+  name: "Runtime Console Action Blackbox"
+  description: |
+    Local-safe workflow for exercising runtime-console Retry, Replay, Cancel,
+    and route pause/resume against a real vflow-server.
+  dialect: vflow
+  tags: [example, runtime-console, retry, replay, cancel]
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        route: /examples/runtime-console-actions
+        webhook_config: { path: /examples/runtime-console-actions, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: decide_delay
+      activity_type: Transform
+      input_mappings:
+        - target: request_id
+          source: { language: v-cel, source: 'trigger_payload.body.request_id' }
+        - target: action_status
+          source: { language: literal, source: "runtime_console_action_ok" }
+
+    - id: wait_boundary
+      activity_type: Timer
+      timer_config:
+        delay_ms: 10
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response:
+          language: v-cel
+          source: |
+            {
+              "status": action_status,
+              "request_id": request_id
+            }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: decide_delay } }
+    - { id: f02, from: { node: decide_delay }, to: { node: wait_boundary } }
+    - { id: f03, from: { node: wait_boundary }, to: { node: respond } }
+    - { id: f04, from: { node: respond }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: request_id, type: string }
+    - { name: action_status, type: string }

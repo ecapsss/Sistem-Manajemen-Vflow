@@ -1,0 +1,63 @@
+version: "3.0"
+metadata:
+  id: vdicl-kyc
+  name: "VDICL Bytecode Rule Engine — KYC Scoring"
+  # VFlow-exclusive: VDICL-compiled rule packs evaluated at 38ns/rule
+  # Rule packs are pre-compiled bytecode loaded at provision time
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        webhook_config: { path: /api/kyc/evaluate, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+    - id: identity_rules
+      activity_type: VRule
+      rule_config:
+        rule_set_id: kyc_identity_v3
+        rule_pack: "compiled/kyc_identity_v3.vdicl"
+        eval_mode: bytecode
+      input_mappings:
+        - target: nik
+          source: { language: v-cel, source: 'trigger_payload.body.nik' }
+        - target: full_name
+          source: { language: v-cel, source: 'trigger_payload.body.name' }
+        - target: dob
+          source: { language: v-cel, source: 'trigger_payload.body.date_of_birth' }
+      output_variable: identity_result
+    - id: risk_rules
+      activity_type: VRule
+      rule_config:
+        rule_set_id: kyc_risk_scoring_v2
+        rule_pack: "compiled/kyc_risk_v2.vdicl"
+        eval_mode: bytecode
+      input_mappings:
+        - target: identity_score
+          source: { language: v-cel, source: 'identity_result.score' }
+        - target: income
+          source: { language: v-cel, source: 'trigger_payload.body.monthly_income' }
+        - target: employment
+          source: { language: v-cel, source: 'trigger_payload.body.employment_status' }
+      output_variable: risk_result
+    - id: merge
+      activity_type: Transform
+      input_mappings:
+        - target: kyc_decision
+          source: { language: v-cel, source: '{"identity": identity_result, "risk": risk_result, "approved": risk_result.score >= 70}' }
+      output_variable: final
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: v-cel, source: 'final.kyc_decision' }
+    - id: end
+      activity_type: End
+  flows:
+    - { id: f1, from: { node: trigger }, to: { node: identity_rules } }
+    - { id: f2, from: { node: identity_rules }, to: { node: risk_rules } }
+    - { id: f3, from: { node: risk_rules }, to: { node: merge } }
+    - { id: f4, from: { node: merge }, to: { node: respond } }
+    - { id: f5, from: { node: respond }, to: { node: end } }

@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package examples;
+
+service OrderRuntime {
+  rpc QuoteOrder(QuoteRequest) returns (QuoteResponse);
+}
+
+message QuoteRequest {
+  string order_id = 1;
+  string customer_id = 2;
+  string currency = 3;
+  int64 subtotal_cents = 4;
+}
+
+message QuoteResponse {
+  string quote_id = 1;
+  string status = 2;
+  int64 final_price_cents = 3;
+  string note = 4;
+}

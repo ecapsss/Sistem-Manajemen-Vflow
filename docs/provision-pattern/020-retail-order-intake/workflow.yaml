@@ -1,0 +1,173 @@
+version: "3.0"
+metadata:
+  id: retail-order-intake
+  name: "Retail Order Intake"
+  description: |
+    Storefront order intake workflow. Validates a cart, normalizes the payload,
+    routes high-value carts to manual review, and reserves inventory for
+    normal carts. This example is runtime-local and does not depend on
+    vflow-cloud.
+  dialect: vflow
+  tags: [example, p0, retail, validation, routing]
+
+spec:
+  durability:
+    enabled: true
+    default_mode: eventual
+
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        route: /examples/retail/orders
+        webhook_config: { path: /examples/retail/orders, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond-accepted
+      output_variable: trigger_payload
+
+    - id: validate_order
+      activity_type: Validate
+      validate_config:
+        input: "$.trigger_payload.body"
+        schema:
+          required: [customer_id, currency, subtotal, items]
+          properties:
+            customer_id: { type: string, min_length: 3 }
+            currency: { type: string, min_length: 3, max_length: 3 }
+            subtotal: { type: number, min: 1 }
+            items: { type: array, min: 1 }
+      output_variable: validated_order
+
+    - id: normalize_order
+      activity_type: Transform
+      input_mappings:
+        - target: order
+          source:
+            language: v-cel
+            source: '{"customer_id": trigger_payload.body.customer_id, "currency": trigger_payload.body.currency, "subtotal": trigger_payload.body.subtotal, "items": trigger_payload.body.items, "item_count": size(trigger_payload.body.items), "risk_band": trigger_payload.body.subtotal >= 1000000 ? "review" : "standard"}'
+      output_variable: order_context
+
+    - id: compute_review_hint
+      activity_type: Transform
+      input_mappings:
+        - target: hint
+          source:
+            language: v-cel
+            source: '{"review_required": order_context.subtotal >= 1000000, "reason": order_context.subtotal >= 1000000 ? "high_value_order" : "standard_order"}'
+      output_variable: review_hint
+
+    - id: process_lines
+      activity_type: LoopForEach
+      loop_config:
+        collection: "$.order_context.items"
+        item_variable: item
+        mode: sequential
+        max_iterations: 100
+
+    - id: inspect_line
+      activity_type: Transform
+      input_mappings:
+        - target: sku
+          source: { language: v-cel, source: 'item.sku' }
+        - target: quantity
+          source: { language: v-cel, source: 'item.qty' }
+      output_variable: last_line
+
+    - id: route_order
+      activity_type: Exclusive
+      description: "High-value orders require manual review before inventory reservation."
+
+    - id: reserve_inventory
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+        timeout_ms: 3000
+        retry_policy:
+          max_attempts: 2
+          base_delay_ms: 100
+          max_delay_ms: 500
+          backoff_factor: 2.0
+      input_mappings:
+        - target: url
+          source: { language: literal, source: "http://127.0.0.1:18020/inventory/reserve" }
+        - target: body
+          source:
+            language: v-cel
+            source: '{"customer_id": order_context.customer_id, "items": order_context.items, "idempotency_key": "retail-order-intake"}'
+      output_variable: inventory_reservation
+
+    - id: accepted_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"status": "accepted", "customer_id": order_context.customer_id, "subtotal": order_context.subtotal, "reservation": inventory_reservation}'
+      output_variable: final_response
+
+    - id: review_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"status": "manual_review", "customer_id": order_context.customer_id, "subtotal": order_context.subtotal, "reason": review_hint.reason}'
+      output_variable: review_response
+
+    - id: rejected_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: literal
+            source: '{"status":"rejected","reason":"invalid_order_payload"}'
+      output_variable: rejected_response
+
+    - id: respond-accepted
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.final_response" }
+
+    - id: respond-review
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.review_response" }
+
+    - id: respond-rejected
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.rejected_response" }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: validate_order } }
+    - { id: f02, from: { node: validate_order }, to: { node: normalize_order } }
+    - { id: f03, from: { node: normalize_order }, to: { node: compute_review_hint } }
+    - { id: f04, from: { node: compute_review_hint }, to: { node: process_lines } }
+    - { id: f05, from: { node: process_lines }, to: { node: inspect_line } }
+    - { id: f06, from: { node: inspect_line }, to: { node: process_lines } }
+    - { id: f07, from: { node: process_lines }, to: { node: route_order }, type: default }
+    - { id: f08, from: { node: route_order }, to: { node: review_response }, condition: "order_context.subtotal >= 1000000", priority: 20 }
+    - { id: f09, from: { node: route_order }, to: { node: reserve_inventory }, type: default, priority: 0 }
+    - { id: f10, from: { node: reserve_inventory }, to: { node: accepted_response } }
+    - { id: f11, from: { node: accepted_response }, to: { node: respond-accepted } }
+    - { id: f12, from: { node: review_response }, to: { node: respond-review } }
+    - { id: f13, type: error, from: { node: validate_order }, to: { node: rejected_response } }
+    - { id: f14, from: { node: rejected_response }, to: { node: respond-rejected } }
+    - { id: f15, from: { node: respond-accepted }, to: { node: end } }
+    - { id: f16, from: { node: respond-review }, to: { node: end } }
+    - { id: f17, from: { node: respond-rejected }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: order_context, type: object }
+    - { name: review_hint, type: object }
+    - { name: inventory_reservation, type: object }

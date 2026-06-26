@@ -1,0 +1,88 @@
+version: "3.0"
+metadata:
+  id: internal-grpc-proto-contract
+  name: "Internal gRPC Proto Contract"
+  description: |
+    Inbound gRPC workflow used for runtime-internal service traffic. It binds
+    protobuf request bytes to typed `trigger_body.*` fields, computes a quote,
+    and returns raw protobuf response bytes through EndTrigger base64 decoding.
+  dialect: vflow
+  tags: [example, p0, grpc, protobuf, internal]
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: grpc
+        grpc:
+          service: "examples.OrderRuntime"
+          method: "QuoteOrder"
+          body_schema: "examples.QuoteRequest"
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: extract_request
+      activity_type: Transform
+      input_mappings:
+        - target: quote_input
+          source:
+            language: v-cel
+            source: '{"order_id": trigger_body.order_id, "customer_id": trigger_body.customer_id, "currency": trigger_body.currency, "subtotal_cents": trigger_body.subtotal_cents}'
+      output_variable: quote_input
+
+    - id: encode_response
+      activity_type: Transform
+      input_mappings:
+        - target: encoded
+          source:
+            language: v-cel
+            source: >
+              proto_encode(
+                {
+                  "name": "QuoteResponse",
+                  "fields": [
+                    {"name": "quote_id",          "number": 1, "type": "string"},
+                    {"name": "status",            "number": 2, "type": "string"},
+                    {"name": "final_price_cents", "number": 3, "type": "int64"},
+                    {"name": "note",              "number": 4, "type": "string"}
+                  ]
+                },
+                {
+                  "quote_id": "quote-" + string(quote_input.order_id),
+                  "status": "quoted",
+                  "final_price_cents": quote_input.subtotal_cents + 1500,
+                  "note": "typed protobuf binding via trigger_body"
+                }
+              )
+      output_variable: encoded_response
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        # Byte-native response (Phase 1 of the gRPC-native devplan,
+        # 2026-05-03). The `encode_response` Transform's
+        # `proto_encode(...)` call writes raw bytes to
+        # `encoded_response`'s handle slot via the
+        # `vil_codec_protobuf` byte sidechannel; `bytes_ref` reads
+        # them with zero conversion. Replaces the legacy
+        # `spv1 + encoding: base64` envelope round-trip.
+        final_response:
+          language: bytes_ref
+          source: "encoded_response"
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: extract_request } }
+    - { id: f02, from: { node: extract_request }, to: { node: encode_response } }
+    - { id: f03, from: { node: encode_response }, to: { node: respond } }
+    - { id: f04, from: { node: respond }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: quote_input, type: object }
+    - { name: encoded_response, type: string }

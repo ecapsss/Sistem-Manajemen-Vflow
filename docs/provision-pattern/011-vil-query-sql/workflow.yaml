@@ -1,0 +1,63 @@
+version: "3.0"
+metadata:
+  id: vil-query-demo
+  name: "VilQuery SQL input-mapping — pre-compiled at upload time"
+  description: |
+    Demonstrates the `vil_query` input-mapping language. The compiler
+    parses the DSL at provision time (`vflow_compiler::vil_query_compile`)
+    into a SQL string + param_refs list, stores both in the VWFC blob, and
+    at runtime the kernel resolves the refs against the VariableStore and
+    hands `{operation: "raw_query", sql, params, _vil_query: true}` to the
+    sqlx connector (bypasses the raw-SQL policy warning because the query
+    went through the parameterised compiler).
+
+    Start with VFLOW_SQLITE_PATH set so the sqlite connector registers:
+      VFLOW_SQLITE_PATH=/tmp/vflow-demo.db cargo run --release
+    then upload this yaml via POST /api/admin/workflow/upload.
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        webhook_config: { path: /api/users/find, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: query
+      activity_type: Connector
+      persistence: ssot         # P4.20: SELECT result — cache on resurrection to skip DB round-trip
+      connector_config:
+        connector_ref: vastar.db.sqlite
+        operation: raw_query
+        timeout_ms: 5000
+      input_mappings:
+        - source:
+            language: vil_query
+            # Pre-compiled at upload: ordering + limit bind literally,
+            # `trigger_payload.body.id` becomes a parameter ref that the
+            # kernel resolves per request.
+            source: |
+              select("users")
+                .columns("id, name, email")
+                .where_eq("id", trigger_payload.body.id)
+                .limit(1)
+      output_variable: result
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response:
+          language: spv1
+          source: '$.result'
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f1, from: { node: trigger },  to: { node: query } }
+    - { id: f2, from: { node: query },    to: { node: respond } }
+    - { id: f3, from: { node: respond },  to: { node: end } }

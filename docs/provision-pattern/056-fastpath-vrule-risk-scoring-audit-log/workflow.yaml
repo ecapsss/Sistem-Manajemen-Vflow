@@ -1,0 +1,74 @@
+version: "3.0"
+metadata:
+  id: fastpath-vrule-risk-scoring-audit-log
+  name: "Fastpath V-Rule Risk Scoring Audit Log"
+  description: "Same payment risk decision as example 047 with request-level fastpath audit_log."
+  audit_log:
+    enabled: true
+    schema_version: "1.0"
+    sink_ref: "pack://examples/risk-bench-audit/audit_nats"
+    subject: "bench.risk.audit.fastpath.request.v1"
+    on: [workflow_succeeded, workflow_failed]
+    emit_mode: async
+    extras:
+      event_type: { language: literal, source: "payment_risk_decision" }
+      mode: { language: literal, source: "fastpath_audit_log" }
+      decision: { language: spv1, source: "$.risk_result.decision" }
+      total_score: { language: spv1, source: "$.risk_result.total_score" }
+      findings_count: { language: spv1, source: "$.risk_result.findings_count" }
+      amount: { language: spv1, source: "$.trigger_payload.body.amount" }
+      country: { language: spv1, source: "$.trigger_payload.body.country" }
+      customer_tier: { language: spv1, source: "$.trigger_payload.body.customer_tier" }
+      audit_status: { language: spv1, source: "$._audit.status" }
+      audit_bytes_in: { language: spv1, source: "$._audit.bytes_in" }
+      audit_bytes_out: { language: spv1, source: "$._audit.bytes_out" }
+      audit_chunks_out: { language: spv1, source: "$._audit.chunks_out" }
+      audit_duration_ms: { language: spv1, source: "$._audit.duration_ms" }
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        runtime_mode: fastpath
+        webhook_config: { path: /bench/fastpath/vrule-risk-audit-log, method: POST }
+        response_framing: length_prefixed
+      output_variable: trigger_payload
+
+    - id: score_risk
+      activity_type: VRule
+      rule_config:
+        tenant_id: examples
+        rule_set_id: fastpath_risk_v1
+        version_policy: latest
+      input_mappings:
+        - target: amount
+          source: { language: spv1, source: "$.trigger_payload.body.amount" }
+        - target: country
+          source: { language: spv1, source: "$.trigger_payload.body.country" }
+        - target: card_bin
+          source: { language: spv1, source: "$.trigger_payload.body.card_bin" }
+        - target: merchant_category
+          source: { language: spv1, source: "$.trigger_payload.body.merchant_category" }
+        - target: customer_tier
+          source: { language: spv1, source: "$.trigger_payload.body.customer_tier" }
+        - target: velocity_1h
+          source: { language: spv1, source: "$.trigger_payload.body.velocity_1h" }
+      output_variable: risk_result
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response:
+          language: spv1
+          source: "$.risk_result"
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f1, from: { node: trigger }, to: { node: score_risk } }
+    - { id: f2, from: { node: score_risk }, to: { node: respond } }
+    - { id: f3, from: { node: respond }, to: { node: end } }

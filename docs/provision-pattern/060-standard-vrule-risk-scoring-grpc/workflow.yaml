@@ -1,0 +1,93 @@
+version: "3.0"
+metadata:
+  id: standard-vrule-risk-scoring-grpc
+  name: "Standard V-Rule Risk Scoring (gRPC)"
+  description: |
+    Apple-to-apple comparator for `049-standard-vrule-risk-scoring`,
+    over gRPC instead of HTTP webhook, on the **standard runtime**.
+    Same V-Rule pack (`fastpath_risk_v1`), same six input fields,
+    equivalent decision shape — isolates pure protocol overhead
+    (gRPC vs HTTP) on the standard runtime path.
+
+    Activities (4): Trigger(grpc) → VRule → EndTrigger → End. Same
+    structure as 049 webhook. Phase 3 of the gRPC-native devplan
+    (2026-05-03) dropped the Transform `encode_response` activity;
+    the V-Rule's rule-output envelope is encoded into
+    `examples.RiskResponse` directly when the pack's
+    `output_proto_schema` is declared. EndTrigger `bytes_ref` reads
+    the raw proto bytes V-Rule writes to `risk_result`'s handle slot.
+
+    For the fastpath gRPC head-to-head with 047 webhook fastpath, see
+    `061-fastpath-vrule-risk-scoring-grpc`.
+
+  dialect: vflow
+  tags: [example, p0, grpc, vrule, risk-scoring, bench]
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: grpc
+        runtime_mode: standard
+        grpc:
+          service: "examples.RiskScoring"
+          method: "ScoreRisk"
+          body_schema: "examples.RiskRequest"
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: score_risk
+      activity_type: VRule
+      rule_config:
+        tenant_id: examples
+        rule_set_id: fastpath_risk_v1
+        version_policy: latest
+      # Input mappings remain identical in shape to 049 (webhook).
+      # The kernel's proto-field tier serves these without entering
+      # the v-cel VM (Phase 1), and V-Rule's proto-native input
+      # path consumes the cached DynamicMessage directly (Phase 2).
+      # Mappings stay in the YAML for two reasons:
+      #   - they document the field-set the rule reads
+      #   - they form the JSON fallback when the proto path
+      #     declines (descriptor not in pool, etc.)
+      input_mappings:
+        - target: amount
+          source: { language: v-cel, source: 'trigger_body.amount' }
+        - target: country
+          source: { language: v-cel, source: 'trigger_body.country' }
+        - target: card_bin
+          source: { language: v-cel, source: 'trigger_body.card_bin' }
+        - target: merchant_category
+          source: { language: v-cel, source: 'trigger_body.merchant_category' }
+        - target: customer_tier
+          source: { language: v-cel, source: 'trigger_body.customer_tier' }
+        - target: velocity_1h
+          source: { language: v-cel, source: 'trigger_body.velocity_1h' }
+      output_variable: risk_result
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        # `bytes_ref` reads raw bytes from the named variable.
+        # Phase 3: V-Rule writes the encoded `examples.RiskResponse`
+        # bytes directly to `risk_result`'s handle slot when the
+        # pack declares `output_proto_schema`. EndTrigger forwards
+        # them to the gRPC adapter with no decode hop.
+        final_response:
+          language: bytes_ref
+          source: "risk_result"
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f1, from: { node: trigger },    to: { node: score_risk } }
+    - { id: f2, from: { node: score_risk }, to: { node: respond } }
+    - { id: f3, from: { node: respond },    to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: risk_result,     type: object }

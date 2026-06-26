@@ -1,0 +1,72 @@
+version: "3.0"
+metadata:
+  id: grpc-unary-connector-contract
+  name: "gRPC Unary Connector Contract"
+  description: |
+    Runtime-local descriptor-backed gRPC unary connector example. The workflow
+    calls grpc.health.v1.Health/Check against a local internal service and
+    returns the decoded protobuf response.
+  dialect: vflow
+  tags: [example, p0, grpc, connector, protobuf, blackbox]
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        route: /examples/grpc-unary
+        webhook_config: { path: /examples/grpc-unary, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: check_internal_service
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.grpc
+        operation: call
+        timeout_ms: 3000
+      input_mappings:
+        - target: endpoint
+          source: { language: literal, source: "http://127.0.0.1:__GRPC_PORT__" }
+        - target: descriptor_set_b64
+          source: { language: literal, source: "__HEALTH_DESCRIPTOR_SET_B64__" }
+        - target: service
+          source: { language: literal, source: "grpc.health.v1.Health" }
+        - target: method
+          source: { language: literal, source: "Check" }
+        - target: request
+          source:
+            language: v-cel
+            source: '{"service": trigger_payload.body.service}'
+      output_variable: grpc_health
+
+    - id: build_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"status": "grpc_unary_ok", "health_status": grpc_health.status, "service": trigger_payload.body.service}'
+      output_variable: final_response
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.final_response" }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: check_internal_service } }
+    - { id: f02, from: { node: check_internal_service }, to: { node: build_response } }
+    - { id: f03, from: { node: build_response }, to: { node: respond } }
+    - { id: f04, from: { node: respond }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: grpc_health, type: object }
+    - { name: final_response, type: object }

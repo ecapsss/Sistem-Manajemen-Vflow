@@ -1,0 +1,186 @@
+version: "3.0"
+metadata:
+  id: local-infra-connector-business-pack
+  name: "Local Infra Connector Business Pack"
+  description: |
+    Return authorization workflow that demonstrates local/lab connector
+    backends in one realistic business flow. Runtime execution is skip-aware
+    because Redis, Etcd, S3/SeaweedFS, SFTP, ClickHouse, and Cassandra/Scylla
+    may not all be present on a developer laptop.
+  dialect: vflow
+  tags: [example, p1, connectors, local-infra, business-pack]
+
+spec:
+  durability:
+    enabled: true
+    default_mode: journal-state
+
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        route: /examples/local-infra/returns
+        webhook_config: { path: /examples/local-infra/returns, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: validate_return
+      activity_type: Validate
+      validate_config:
+        input: "$.trigger_payload.body"
+        schema:
+          required: [return_id, order_id, customer_id, sku, reason, idempotency_key]
+          properties:
+            return_id: { type: string, min_length: 3 }
+            order_id: { type: string, min_length: 3 }
+            customer_id: { type: string, min_length: 3 }
+            sku: { type: string, min_length: 2 }
+            reason: { type: string, min_length: 3 }
+            idempotency_key: { type: string, min_length: 8 }
+      output_variable: validated_return
+
+    - id: normalize_return
+      activity_type: Transform
+      input_mappings:
+        - target: return_context
+          source:
+            language: v-cel
+            source: '{"return_id": trigger_payload.body.return_id, "order_id": trigger_payload.body.order_id, "customer_id": trigger_payload.body.customer_id, "sku": trigger_payload.body.sku, "reason": trigger_payload.body.reason, "idempotency_key": trigger_payload.body.idempotency_key, "s3_key": "returns/" + trigger_payload.body.return_id + "/evidence.json", "manifest_path": "/upload/returns/" + trigger_payload.body.return_id + ".json"}'
+      output_variable: return_context
+
+    - id: redis_idempotency_lock
+      activity_type: Connector
+      persistence: ssot
+      description: "Retry-safe intake lock. Current-version retry must reuse the same idempotency key."
+      connector_config:
+        connector_ref: vastar.redis
+        operation: set_ex
+      input_mappings:
+        - target: key
+          source:
+            language: v-cel
+            source: '"vflow:examples:returns:idempotency:" + return_context.idempotency_key'
+        - target: value
+          source:
+            language: v-cel
+            source: '{"return_id": return_context.return_id, "status": "received"}'
+        - target: ttl
+          source: { language: literal, source: "86400" }
+      output_variable: idempotency_lock
+
+    - id: etcd_route_snapshot
+      activity_type: Connector
+      persistence: durable_strict
+      connector_config:
+        connector_ref: vastar.etcd
+        operation: put
+      input_mappings:
+        - target: key
+          source:
+            language: v-cel
+            source: '"/vflow/examples/returns/routes/" + return_context.return_id'
+        - target: value
+          source:
+            language: v-cel
+            source: '{"route": "warehouse-rma", "sku": return_context.sku, "reason": return_context.reason}'
+      output_variable: route_snapshot
+
+    - id: cassandra_customer_lookup
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.cassandra
+        operation: select
+      input_mappings:
+        - target: query
+          source:
+            language: literal
+            source: "SELECT release_version FROM system.local"
+      output_variable: customer_backend
+
+    - id: clickhouse_audit_ready
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.clickhouse
+        operation: ping
+      output_variable: analytics_ready
+
+    - id: store_evidence_bundle
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.s3
+        operation: put_object
+      input_mappings:
+        - target: key
+          source: { language: spv1, source: "$.return_context.s3_key" }
+        - target: body
+          source:
+            language: v-cel
+            source: '{"return_id": return_context.return_id, "order_id": return_context.order_id, "customer_id": return_context.customer_id, "sku": return_context.sku, "reason": return_context.reason}'
+      output_variable: evidence_object
+
+    - id: drop_warehouse_manifest
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.sftp
+        operation: upload
+      input_mappings:
+        - target: path
+          source: { language: spv1, source: "$.return_context.manifest_path" }
+        - target: data
+          source:
+            language: v-cel
+            source: '{"return_id": return_context.return_id, "sku": return_context.sku, "s3_key": return_context.s3_key}'
+      output_variable: warehouse_manifest
+
+    - id: local_pack_audit
+      activity_type: Connector
+      connector_config:
+        connector_ref: "pack://examples/hello-db/primary"
+        operation: raw_query
+      input_mappings:
+        - target: query
+          source:
+            language: literal
+            source: "select 'return-accepted' as event_type"
+      output_variable: pack_audit
+
+    - id: accepted_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"status": "accepted", "return_id": return_context.return_id, "evidence_key": return_context.s3_key, "manifest_path": return_context.manifest_path, "retry_warning": "operator retry uses current active workflow version; preserve idempotency_key"}'
+      output_variable: final_response
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.final_response" }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: validate_return } }
+    - { id: f02, from: { node: validate_return }, to: { node: normalize_return } }
+    - { id: f03, from: { node: normalize_return }, to: { node: redis_idempotency_lock } }
+    - { id: f04, from: { node: redis_idempotency_lock }, to: { node: etcd_route_snapshot } }
+    - { id: f05, from: { node: etcd_route_snapshot }, to: { node: cassandra_customer_lookup } }
+    - { id: f06, from: { node: cassandra_customer_lookup }, to: { node: clickhouse_audit_ready } }
+    - { id: f07, from: { node: clickhouse_audit_ready }, to: { node: store_evidence_bundle } }
+    - { id: f08, from: { node: store_evidence_bundle }, to: { node: drop_warehouse_manifest } }
+    - { id: f09, from: { node: drop_warehouse_manifest }, to: { node: local_pack_audit } }
+    - { id: f10, from: { node: local_pack_audit }, to: { node: accepted_response } }
+    - { id: f11, from: { node: accepted_response }, to: { node: respond } }
+    - { id: f12, from: { node: respond }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: return_context, type: object }
+    - { name: final_response, type: object }

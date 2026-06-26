@@ -1,0 +1,33 @@
+// Apple-to-apple gRPC counterpart of 049-standard-vrule-risk-scoring.
+// Same V-Rule pack, same input fields, equivalent decision shape — wire
+// format swapped from JSON-over-HTTP to protobuf-over-gRPC.
+
+syntax = "proto3";
+
+package examples;
+
+service RiskScoring {
+  // Stateless payment risk scoring. Input fields mirror the 049 webhook
+  // payload one-to-one.
+  rpc ScoreRisk(RiskRequest) returns (RiskResponse);
+}
+
+message RiskRequest {
+  int64  amount            = 1;
+  string country           = 2;
+  string card_bin          = 3;
+  string merchant_category = 4;
+  string customer_tier     = 5;
+  int32  velocity_1h       = 6;
+}
+
+// Subset of the V-Rule decision envelope. The full decision (including
+// findings array) lives in `risk_result` inside the workflow; this
+// proto returns the headline scalars only — equivalent to the
+// observable-on-the-wire summary that 049 returns as
+// {"decision","total_score","findings_count",...}.
+message RiskResponse {
+  string decision       = 1;
+  int32  total_score    = 2;
+  int32  findings_count = 3;
+}

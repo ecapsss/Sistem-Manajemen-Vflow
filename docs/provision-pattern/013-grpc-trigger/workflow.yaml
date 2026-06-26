@@ -1,0 +1,125 @@
+version: "3.0"
+metadata:
+  id: grpc-provision-tenant
+  name: "gRPC inbound trigger — CEL typed binding + Transform encode"
+  description: |
+    Demonstrates vflow's inbound gRPC trigger with Phase 1 CEL
+    typed protobuf binding. No Connector activity — all data
+    transformation is via `Transform` + FaaS.
+
+    Activity layering:
+      * Trigger(grpc)            — transport; declares body_schema
+      * extract  (Transform)     — typed field access via CEL
+                                   (trigger_body.tenant_name)
+      * encode   (Transform)     — proto_encode FaaS call
+      * EndTrigger              — returns base64-framed bytes
+
+    Schema binding (Phase 1): `body_schema: "cloud.ProvisionRequest"`
+    tells the kernel to resolve the descriptor from ProtoRegistry
+    (populated by `POST /api/admin/proto/upload`) and install it
+    on the kernel. When any CEL expression touches `trigger_body`,
+    Tier 2 VM decodes the bytes via `prost_reflect::DynamicMessage`
+    and binds as `VcelValue::Message`, so field access is typed:
+    `trigger_body.tenant_name` returns a String.
+
+    Smoke:
+      ```bash
+      VFLOW_GRPC_ENABLED=1 VFLOW_WORKFLOWS_DIR=./ vflow-server &
+
+      curl -sX POST http://localhost:7799/api/admin/proto/upload \
+           -H 'X-VFlow-Proto-File: cloud_control.proto' \
+           -H 'Content-Type: text/plain' \
+           --data-binary @proto/cloud_control.proto
+
+      grpcurl -plaintext \
+          -import-path ./proto -proto cloud_control.proto \
+          -d '{"tenant_name":"acme","plan":"pro"}' \
+          localhost:50051 cloud.CloudControl/ProvisionTenant
+      ```
+
+    Expected:
+      ```json
+      {"tenantId":"tenant-acme","status":"provisioned",
+       "note":"Phase 1 CEL typed binding + Transform encode"}
+      ```
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: grpc
+        grpc:
+          service: "cloud.CloudControl"
+          method: "ProvisionTenant"
+          body_schema: "cloud.ProvisionRequest"
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    # Transform 1 — extract typed fields from the proto-bound
+    # `trigger_body`. Each input_mapping's v-cel expression is
+    # evaluated with the kernel's proto_bindings in scope so
+    # `trigger_body.field` does typed protobuf field access. Each
+    # target becomes a top-level workflow variable.
+    - id: extract
+      activity_type: Transform
+      input_mappings:
+        - target: tenant_name
+          source:
+            language: v-cel
+            source: 'trigger_body.tenant_name'
+        - target: plan
+          source:
+            language: v-cel
+            source: 'trigger_body.plan'
+
+    # Transform 2 — encode response via FaaS. References
+    # top-level `tenant_name` directly (plain string), avoiding
+    # the need for proto-bound eval inside FaaS arg evaluation.
+    - id: encode_response
+      activity_type: Transform
+      input_mappings:
+        - target: encoded
+          source:
+            language: v-cel
+            source: >
+              proto_encode(
+                {
+                  "name": "ProvisionResponse",
+                  "fields": [
+                    {"name": "tenant_id", "number": 1, "type": "string"},
+                    {"name": "status",    "number": 2, "type": "string"},
+                    {"name": "note",      "number": 3, "type": "string"}
+                  ]
+                },
+                {
+                  "tenant_id": "tenant-" + string(tenant_name),
+                  "status":    "provisioned",
+                  "note":      "Phase 1 CEL typed binding + Transform encode"
+                }
+              )
+      output_variable: resp
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        # Byte-native response (Phase 1 of the gRPC-native devplan,
+        # 2026-05-03). The `encode_response` Transform's
+        # `proto_encode(...)` call writes raw bytes to `resp`'s handle
+        # slot via the `vil_codec_protobuf` byte sidechannel; `bytes_ref`
+        # reads them with zero conversion. Replaces the legacy
+        # `spv1 + encoding: base64` round-trip.
+        final_response:
+          language: bytes_ref
+          source: 'resp'
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f1, from: { node: trigger },         to: { node: extract } }
+    - { id: f2, from: { node: extract },         to: { node: encode_response } }
+    - { id: f3, from: { node: encode_response }, to: { node: respond } }
+    - { id: f4, from: { node: respond },         to: { node: end } }

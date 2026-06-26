@@ -1,0 +1,83 @@
+version: "3.0"
+metadata:
+  id: fastpath-ai-gateway-stream-detached-nats-publish
+  name: "Fastpath AI Gateway Stream Detached NATS Publish"
+  description: "AI gateway streaming with user-authored detached NATS publish for the audit event. Apple-to-apple comparator for 057 (framework metadata.audit_log) — both fastpath stream, both publish to NATS post-stream, but 059 uses a user-authored detached branch (Transform → Connector) instead of the framework AuditEmitter pipeline."
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        runtime_mode: fastpath
+        webhook_config:
+          path: /api/gw/stream-detached-nats
+          method: POST
+        response_framing: chunked
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: call_simulator
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+        streaming: true
+        dialect: openai
+        json_tap: "choices[0].delta.content"
+        timeout_ms: 30000
+      input_mappings:
+        - target: url
+          source:
+            language: literal
+            source: "http://127.0.0.1:4545/v1/chat/completions"
+        - target: body
+          source:
+            language: literal
+            source: '{"model":"gpt-4","messages":[{"role":"user","content":"Benchmark performance test via VIL"}],"stream":true}'
+      output_variable: llm_result
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response:
+          language: v-cel
+          source: '{"content": llm_result.content}'
+
+    - id: build_audit_record
+      activity_type: Transform
+      input_mappings:
+        - target: audit_record
+          source:
+            language: v-cel
+            source: '{"event_type":"ai_gateway_stream","mode":"fastpath_stream_detached_nats","audit_status":_audit.status,"audit_bytes_in":_audit.bytes_in,"audit_bytes_out":_audit.bytes_out,"audit_chunks_out":_audit.chunks_out,"audit_duration_ms":_audit.duration_ms,"route":_path}'
+      output_variable: audit_record
+
+    - id: publish_audit_event
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.nats
+        operation: publish
+        timeout_ms: 1000
+      input_mappings:
+        - target: subject
+          source: { language: literal, source: "bench.ai_gateway.audit.fastpath.detached.v1" }
+        - target: payload
+          source: { language: spv1, source: "$.audit_record" }
+      output_variable: audit_publish
+
+    - id: end
+      activity_type: End
+
+    - id: audit_end
+      activity_type: End
+
+  flows:
+    - { id: f1, from: { node: trigger }, to: { node: call_simulator } }
+    - { id: f2, from: { node: call_simulator }, to: { node: respond } }
+    - { id: f3, from: { node: respond }, to: { node: end } }
+    - { id: f4, from: { node: respond }, to: { node: build_audit_record }, detached: true }
+    - { id: f5, from: { node: build_audit_record }, to: { node: publish_audit_event } }
+    - { id: f6, from: { node: publish_audit_event }, to: { node: audit_end } }

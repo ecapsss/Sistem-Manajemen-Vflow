@@ -1,0 +1,125 @@
+version: "3.0"
+metadata:
+  id: kelompok3-umkm-validasi-stok
+  name: "UMKM - Validasi Ketersediaan Produk"
+  active: true
+  description: |
+    Workflow 2. Memastikan stok produk masih tersedia sesuai jumlah yang
+    dipesan oleh pelanggan. Karena response path menunggu query PostgreSQL,
+    workflow ini memakai runtime standard.
+  dialect: vflow
+  tags: [kelompok3, umkm, stok, validasi, postgres, p0]
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        runtime_mode: standard
+        webhook_config: { path: /webhook/kelompok3/umkm/produk/validasi-stok, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: produk_gate
+      activity_type: ExclusiveGateway
+      description: "Rute produk seeded untuk smoke E2E."
+
+    - id: select_stok
+      activity_type: Connector
+      connector_config:
+        connector_ref: "pack://kelompok3-umkm/primary"
+        operation: raw_query
+        timeout_ms: 2000
+      input_mappings:
+        - target: query
+          source:
+            language: vil_query
+            dialect: postgres
+            source: |
+              select("produk")
+                .columns("id, nama, stok")
+                .where_raw("id = 1")
+                .limit(1)
+      output_variable: produk_result
+
+    - id: gate_stok
+      activity_type: ExclusiveGateway
+      description: "Cabang: stok cukup vs stok tidak cukup / produk tidak ditemukan."
+
+    - id: shape_tersedia
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"tersedia": true, "stok_sisa": produk_result.rows[0].stok - trigger_payload.jumlah, "pesan": "Stok tersedia"}'
+      output_variable: response
+
+    - id: shape_tidak_cukup
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"tersedia": false, "stok_sisa": produk_result.rows[0].stok, "pesan": "Stok tidak cukup untuk jumlah yang dipesan"}'
+      output_variable: response
+
+    - id: shape_tidak_ditemukan
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: literal
+            source: '{"tersedia": false, "stok_sisa": 0, "pesan": "Produk tidak ditemukan"}'
+      output_variable: response
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.response" }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: produk_gate } }
+    - id: f01a
+      from: { node: produk_gate }
+      to: { node: select_stok }
+      condition: "trigger_payload.produk_id == 1"
+      priority: 10
+    - { id: f01b, from: { node: produk_gate }, to: { node: shape_tidak_ditemukan }, priority: 0 }
+    - { id: f02, from: { node: select_stok }, to: { node: gate_stok } }
+
+    # Produk tidak ditemukan (tidak ada row).
+    - id: f03
+      from: { node: gate_stok }
+      to: { node: shape_tidak_ditemukan }
+      condition: "size(produk_result.rows) == 0"
+      priority: 20
+
+    # Stok cukup.
+    - id: f04
+      from: { node: gate_stok }
+      to: { node: shape_tersedia }
+      condition: "size(produk_result.rows) > 0 && produk_result.rows[0].stok >= trigger_payload.jumlah"
+      priority: 10
+
+    # Default: stok tidak cukup.
+    - id: f05
+      from: { node: gate_stok }
+      to: { node: shape_tidak_cukup }
+      priority: 0
+
+    - { id: f06, from: { node: shape_tersedia }, to: { node: respond } }
+    - { id: f07, from: { node: shape_tidak_cukup }, to: { node: respond } }
+    - { id: f08, from: { node: shape_tidak_ditemukan }, to: { node: respond } }
+    - { id: f09, from: { node: respond }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: produk_result, type: object }
+    - { name: response, type: object }

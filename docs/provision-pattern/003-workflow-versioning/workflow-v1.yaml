@@ -1,0 +1,38 @@
+version: "3.0"
+metadata:
+  id: order-process
+  version: 1
+  name: "Order Processing v1"
+  # Blue-green versioning: v1 is active, v2 can be tested via @v2 suffix
+  # Deploy v1: curl -X POST /workflow/provision -d @workflow-v1.yaml
+  # Test v2:   curl -X POST /workflow/provision -d @workflow-v2.yaml
+  # Traffic:   curl -X POST /workflow/order-process@v2/activate
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        webhook_config: { path: /api/orders, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+    - id: validate
+      activity_type: Transform
+      input_mappings:
+        - target: order
+          source: { language: v-cel, source: 'trigger_payload.body' }
+        - target: is_valid
+          source: { language: v-cel, source: 'trigger_payload.body.total > 0 && trigger_payload.body.items.size() > 0' }
+      output_variable: validated
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: v-cel, source: 'validated' }
+    - id: end
+      activity_type: End
+  flows:
+    - { id: f1, from: { node: trigger }, to: { node: validate } }
+    - { id: f2, from: { node: validate }, to: { node: respond } }
+    - { id: f3, from: { node: respond }, to: { node: end } }

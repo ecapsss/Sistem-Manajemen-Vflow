@@ -1,0 +1,47 @@
+version: "3.0"
+metadata:
+  id: vcel-lambda-demo-fastpath
+  name: "Full V-CEL Lambda Expressions - Fastpath"
+  # Fastpath: synchronous response path is optimized while preserving
+  # declarative Transform semantics for stateless request/response workloads.
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        runtime_mode: fastpath
+        webhook_config: { path: /api/catalog/analyze-fastpath, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+    - id: filter_expensive
+      activity_type: Transform
+      input_mappings:
+        - target: high_value_items
+          source: { language: v-cel, source: 'trigger_payload.body.items.filter(x, x.price > 100000)' }
+        - target: names
+          source: { language: v-cel, source: 'trigger_payload.body.users.map(u, u.name)' }
+        - target: valid_email
+          source: { language: v-cel, source: 'trigger_payload.body.email.matches("^[^@]+@[^@]+\\.[a-z]+$")' }
+        - target: expires
+          source: { language: v-cel, source: 'timestamp("2026-12-31T23:59:59Z")' }
+      output_variable: filtered
+    - id: aggregate
+      activity_type: Transform
+      input_mappings:
+        - target: summary
+          source: { language: v-cel, source: '{"total_high_value": high_value_items.size(), "user_list": names, "email_ok": valid_email, "deadline": expires, "price_tags": high_value_items.map(i, i.name + ": Rp" + string(i.price))}' }
+      output_variable: summary
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: v-cel, source: 'summary' }
+    - id: end
+      activity_type: End
+  flows:
+    - { id: f1, from: { node: trigger }, to: { node: filter_expensive } }
+    - { id: f2, from: { node: filter_expensive }, to: { node: aggregate } }
+    - { id: f3, from: { node: aggregate }, to: { node: respond } }
+    - { id: f4, from: { node: respond }, to: { node: end } }

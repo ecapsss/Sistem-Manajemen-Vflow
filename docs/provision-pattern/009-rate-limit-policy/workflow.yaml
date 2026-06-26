@@ -1,0 +1,61 @@
+version: "3.0"
+metadata:
+  id: rate-limited-api
+  name: "Rate Limit + Policy Enforcement"
+  # VFlow-exclusive: per-workflow rate limiting and connector policy
+  # rate_limit: max requests per window
+  # policy.deny_connectors: block certain connector refs at runtime
+  # policy.allowed_hosts: restrict outbound HTTP destinations
+spec:
+  rate_limit:
+    max_requests: 100
+    window_seconds: 60
+    burst: 20
+    key: "{tenant_id}"
+  policy:
+    deny_connectors:
+      - vastar.shell
+      - vastar.file_write
+    allowed_hosts:
+      - "api.internal.example.com"
+      - "payment-gw.example.com"
+    max_execution_ms: 5000
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        webhook_config: { path: /api/protected/data, method: GET }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+    - id: fetch_data
+      activity_type: Connector
+      persistence: ssot         # P4.20: cached GET response; skip re-fetch on resurrection
+      connector_config:
+        connector_ref: vastar.http
+        operation: get
+      input_mappings:
+        - target: url
+          source: { language: v-cel, source: '"https://api.internal.example.com/v1/data/" + trigger_payload.query.id' }
+        - target: headers
+          source: { language: v-cel, source: '{"Authorization": "Bearer " + trigger_payload.headers["x-api-key"]}' }
+      output_variable: api_data
+    - id: sanitize
+      activity_type: Transform
+      input_mappings:
+        - target: result
+          source: { language: v-cel, source: '{"data": api_data.body, "served_at": timestamp(now), "rate_remaining": __vflow_rate.remaining}' }
+      output_variable: sanitized
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: v-cel, source: 'sanitized.result' }
+    - id: end
+      activity_type: End
+  flows:
+    - { id: f1, from: { node: trigger }, to: { node: fetch_data } }
+    - { id: f2, from: { node: fetch_data }, to: { node: sanitize } }
+    - { id: f3, from: { node: sanitize }, to: { node: respond } }
+    - { id: f4, from: { node: respond }, to: { node: end } }

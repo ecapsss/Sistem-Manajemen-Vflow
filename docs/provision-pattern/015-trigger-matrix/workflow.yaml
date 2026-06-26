@@ -1,0 +1,186 @@
+version: "3.0"
+metadata:
+  id: trigger-matrix
+  name: "P0 Trigger matrix"
+  description: |
+    Compile-time contract for trigger declarations that are currently accepted
+    by the VWFD TriggerConfig schema. Local/lab execution is handled by
+    skip-aware runtime smokes where external brokers are needed.
+
+    Remaining TriggerRegistry kinds that still need typed YAML/parser coverage:
+    iot, evm, and grpc_stream.
+
+spec:
+  activities:
+    - id: webhook_in
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        webhook_config: { path: /examples/triggers/webhook, method: POST }
+      output_variable: webhook_payload
+
+    - id: cron_in
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: cron
+        route: /examples/triggers/cron
+        cron:
+          expression: "1m"
+          timezone: "UTC"
+      output_variable: cron_payload
+
+    - id: grpc_in
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: grpc
+        route: /examples/triggers/grpc
+        grpc:
+          service: examples.TriggerMatrix
+          method: Fire
+          body_schema: examples.TriggerMatrixRequest
+      output_variable: grpc_payload
+
+    - id: nats_in
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: nats
+        route: /examples/triggers/nats
+        nats:
+          urls: "nats://localhost:4222"
+          subject: "examples.trigger.matrix"
+          queue_group: "vflow-examples"
+      output_variable: nats_payload
+
+    - id: nats_js_in
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: nats_js
+        route: /examples/triggers/nats-js
+        nats_js:
+          urls: "nats://localhost:4222"
+          stream: "EXAMPLES_TRIGGER_MATRIX"
+          durable_name: "vflow-examples-trigger-matrix"
+          filter_subject: "examples.trigger.matrix.js"
+          ack_policy: explicit
+          deliver_policy: all
+          max_deliver: 3
+      output_variable: nats_js_payload
+
+    - id: nats_kv_in
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: nats_kv
+        route: /examples/triggers/nats-kv
+        nats_kv:
+          urls: "nats://localhost:4222"
+          bucket: "VFLOW_EXAMPLES"
+          key_prefix: "trigger_matrix."
+      output_variable: nats_kv_payload
+
+    - id: kafka_in
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: kafka
+        route: /examples/triggers/kafka
+        kafka:
+          brokers: "localhost:9092"
+          topics: ["examples.trigger.matrix"]
+          group_id: "vflow-examples"
+      output_variable: kafka_payload
+
+    - id: mqtt_in
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: mqtt
+        route: /examples/triggers/mqtt
+        mqtt:
+          url: "mqtt://localhost:1883"
+          topic: "examples/trigger/matrix"
+      output_variable: mqtt_payload
+
+    - id: s3_event_in
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: s3_event
+        route: /examples/triggers/s3-event
+        s3_event:
+          bucket: "vflow-examples"
+          prefix: "trigger-matrix/"
+      output_variable: s3_event_payload
+
+    - id: sftp_in
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: sftp
+        route: /examples/triggers/sftp
+        sftp:
+          host: "localhost"
+          watch_dir: "/tmp/vflow-examples/inbox"
+      output_variable: sftp_payload
+
+    - id: db_poll_in
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: db_poll
+        route: /examples/triggers/db-poll
+        db_poll:
+          database_url: "sqlite:///tmp/vflow-examples-trigger-matrix.db"
+          query: "SELECT id, payload FROM events WHERE id > ? ORDER BY id LIMIT 10"
+          interval_ms: 1000
+      output_variable: db_poll_payload
+
+    - id: fs_in
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: fs
+        route: /examples/triggers/fs
+        fs:
+          watch_path: "/tmp/vflow-examples/inbox"
+      output_variable: fs_payload
+
+    - id: cdc_in
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: cdc
+        route: /examples/triggers/cdc
+        cdc:
+          database_url: "postgres://user:pass@localhost:5432/app"
+          table: "public.orders"
+      output_variable: cdc_payload
+
+    - id: email_in
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: email
+        route: /examples/triggers/email
+        email:
+          imap_url: "imaps://user:pass@localhost:993"
+          mailbox: "INBOX"
+      output_variable: email_payload
+
+    - id: normalize
+      activity_type: Transform
+      input_mappings:
+        - target: accepted
+          source: { language: literal, source: "trigger accepted" }
+      output_variable: result
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f_webhook, from: { node: webhook_in }, to: { node: normalize } }
+    - { id: f_cron, from: { node: cron_in }, to: { node: normalize } }
+    - { id: f_grpc, from: { node: grpc_in }, to: { node: normalize } }
+    - { id: f_nats, from: { node: nats_in }, to: { node: normalize } }
+    - { id: f_nats_js, from: { node: nats_js_in }, to: { node: normalize } }
+    - { id: f_nats_kv, from: { node: nats_kv_in }, to: { node: normalize } }
+    - { id: f_kafka, from: { node: kafka_in }, to: { node: normalize } }
+    - { id: f_mqtt, from: { node: mqtt_in }, to: { node: normalize } }
+    - { id: f_s3, from: { node: s3_event_in }, to: { node: normalize } }
+    - { id: f_sftp, from: { node: sftp_in }, to: { node: normalize } }
+    - { id: f_db_poll, from: { node: db_poll_in }, to: { node: normalize } }
+    - { id: f_fs, from: { node: fs_in }, to: { node: normalize } }
+    - { id: f_cdc, from: { node: cdc_in }, to: { node: normalize } }
+    - { id: f_email, from: { node: email_in }, to: { node: normalize } }
+    - { id: f_done, from: { node: normalize }, to: { node: end } }

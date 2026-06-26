@@ -1,0 +1,62 @@
+version: "3.0"
+metadata:
+  id: cdc-postgres-runtime-e2e
+  name: "PostgreSQL CDC Runtime E2E"
+  description: |
+    PostgreSQL logical-slot CDC workflow. The runtime subscribes to row changes,
+    normalizes the decoded event, and posts it to an internal audit endpoint.
+  dialect: vflow
+  tags: [example, p1, cdc, postgres, trigger, runtime-e2e]
+
+spec:
+  activities:
+    - id: order_changed
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: cdc
+        route: /examples/cdc/orders
+        cdc:
+          database_url: "postgres://postgres:postgres@127.0.0.1:5432/vflow_cdc"
+          table: "public.vflow_orders"
+          slot_name: "vflow_orders_slot"
+          publication: "vflow_orders_pub"
+          start_lsn: "0/0"
+      output_variable: trigger_payload
+
+    - id: normalize_change
+      activity_type: Transform
+      input_mappings:
+        - target: event
+          source:
+            language: v-cel
+            source: '{"event_type": "order_cdc", "table": trigger_payload.table, "operation": trigger_payload.operation, "lsn": trigger_payload.lsn, "raw": trigger_payload.data}'
+      output_variable: cdc_event
+
+    - id: notify_audit
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+        timeout_ms: 3000
+      input_mappings:
+        - target: url
+          source: { language: literal, source: "http://127.0.0.1:18035/cdc-events" }
+        - target: body
+          source:
+            language: v-cel
+            source: '{"event_type": "order_cdc", "table": trigger_payload.table, "operation": trigger_payload.operation, "lsn": trigger_payload.lsn, "raw": trigger_payload.data}'
+      output_variable: audit_result
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: order_changed }, to: { node: normalize_change } }
+    - { id: f02, from: { node: normalize_change }, to: { node: notify_audit } }
+    - { id: f03, from: { node: notify_audit }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: cdc_event, type: object }
+    - { name: audit_result, type: object }

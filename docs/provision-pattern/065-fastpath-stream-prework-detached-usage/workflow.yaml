@@ -1,0 +1,225 @@
+version: "3.0"
+metadata:
+  id: fastpath-stream-prework-detached-usage
+  name: "Fastpath Stream With Prework And Detached Usage"
+  description: "Acisku-style fastpath streaming endpoint: auth/quota prework, zero-copy SSE forwarding, and detached usage accounting."
+  dialect: vflow
+  tags: [fastpath, stream, sse, openai, vil_query, detached, authoring-guide]
+
+spec:
+  activities:
+    # Fastpath is selected at Trigger level. This is important: authors should
+    # not rely on runtime inference. The trigger also declares chunked framing
+    # because a streaming connector will send response chunks to the client.
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        runtime_mode: fastpath
+        webhook_config:
+          path: /examples/fastpath/stream-prework
+          method: POST
+        response_framing: chunked
+        end_activity: respond
+      output_variable: trigger_payload
+
+    # This example is benchmark-local: the request may carry x-user-uid, and
+    # otherwise falls back to a stable bench user. Production packs should
+    # replace this with Firebase/RS256 verification and derive uid from the
+    # verified token, not from a client-controlled header.
+    - id: auth_context
+      activity_type: Transform
+      input_mappings:
+        - target: uid
+          source:
+            language: v-cel
+            source: >
+              has(trigger_payload.headers.x_user_uid) &&
+              trigger_payload.headers.x_user_uid != "" ?
+              trigger_payload.headers.x_user_uid :
+              "bench-user"
+      output_variable: auth
+
+    # literal is the cheapest mapping language. Use it for constants such as
+    # feature keys, connector URLs, static subjects, and fixed policy labels.
+    - id: quota_feature_context
+      activity_type: Transform
+      input_mappings:
+        - target: feature
+          source: { language: literal, source: "financial_analysis" }
+      output_variable: quota_context
+
+    # Keep the example self-contained for the primary benchmark runner. In a
+    # production pack this table is created by schema migration/bootstrap.
+    - id: ensure_usage_table
+      activity_type: Connector
+      connector_config:
+        connector_ref: "pack://examples/acisku/primary"
+        operation: execute
+      input_mappings:
+        - target: sql
+          source:
+            language: literal
+            source: >
+              CREATE TABLE IF NOT EXISTS usage_tracking (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uid TEXT NOT NULL,
+                feature TEXT NOT NULL,
+                used_at TEXT DEFAULT (datetime('now'))
+              )
+      output_variable: usage_schema
+
+    # DB access uses vil_query rather than hand-written SQL. The compiler emits
+    # parameterized SQL plus ordered params. Runtime receives structured query
+    # input, not string-concatenated SQL.
+    - id: load_usage_count
+      activity_type: Connector
+      connector_config:
+        connector_ref: "pack://examples/acisku/primary"
+        operation: raw_query
+      input_mappings:
+        - target: query
+          source:
+            language: vil_query
+            dialect: sqlite
+            source: |
+              select("usage_tracking")
+                .count_as("used")
+                .where_eq("uid", auth.uid)
+                .where_eq("feature", quota_context.feature)
+                .where_raw("used_at >= datetime('now', '-30 days')")
+      output_variable: usage_count
+
+    # V-CEL is appropriate here because the values are derived from prior
+    # activity outputs. count_as returns one row, but defensive expressions are
+    # still preferred when a query can return zero rows.
+    - id: quota_gate
+      activity_type: Transform
+      input_mappings:
+        - target: used
+          source: { language: v-cel, source: "int(usage_count.rows[0].used)" }
+        - target: limit
+          source: { language: literal, source: "30" }
+        - target: allowed
+          source: { language: v-cel, source: "int(usage_count.rows[0].used) < 30" }
+      output_variable: quota_gate
+
+    # This Transform is reached only when the request is rejected before the
+    # stream starts. It prepares the JSON payload that EndTrigger will return.
+    - id: quota_exceeded_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: >
+              {
+                "_status": 403,
+                "error": "quota_exceeded",
+                "feature": quota_context.feature,
+                "used": quota_gate.used,
+                "limit": quota_gate.limit
+              }
+      output_variable: api_response
+
+    # The streaming connector is the response producer. json_tap extracts
+    # OpenAI-compatible delta content from each SSE data event inside the HTTP
+    # connector, before chunks reach workflow-level transforms.
+    #
+    # There is intentionally no output_variable on this node. That keeps the
+    # fastpath stream hot path from collecting the full response body. Add an
+    # output_variable only if post-stream V-CEL really needs the whole content.
+    - id: call_ai_stream
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+        streaming: true
+        format: sse
+        dialect: openai
+        json_tap: "choices[0].delta.content"
+        timeout_ms: 120000
+      input_mappings:
+        - target: url
+          source:
+            language: literal
+            source: "http://127.0.0.1:4545/v1/chat/completions"
+        - target: body
+          source:
+            language: v-cel
+            source: >
+              {
+                "model": "gpt-4",
+                "messages": [
+                  {
+                    "role": "system",
+                    "content": "You are a local benchmark financial analysis assistant. Reply in concise Markdown."
+                  },
+                  {
+                    "role": "user",
+                    "content": string(trigger_payload.body.message) +
+                      "\n\nFINANCIAL_CONTEXT_JSON:\n" +
+                      string(trigger_payload.body.context)
+                  }
+                ],
+                "temperature": 0.7,
+                "max_completion_tokens": 4096,
+                "stream": true
+              }
+
+    # Detached side effect. This branch is spawned after the stream connector is
+    # accepted/closed and must not hold the client response open. Because the
+    # branch only needs auth.uid and quota_context.feature, it does not require
+    # the streamed response body.
+    - id: insert_usage_tracking
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: "pack://examples/acisku/primary"
+        operation: raw_query
+      input_mappings:
+        - target: query
+          source:
+            language: vil_query
+            dialect: sqlite
+            source: |
+              insert("usage_tracking")
+                .insert_columns("uid, feature")
+                .value(auth.uid)
+                .value(quota_context.feature)
+      output_variable: usage_insert
+
+    # EndTrigger is still required so the graph has one client-response endpoint.
+    # If quota fails before the stream starts, this response is evaluated and
+    # returned. If call_ai_stream ran, the client already received stream bytes;
+    # post-stream continuation does not evaluate this final_response.
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: v-cel, source: "api_response.response" }
+
+    - id: end
+      activity_type: End
+
+    - id: usage_end
+      activity_type: End
+
+  flows:
+    # Main response path: auth -> quota -> stream or reject.
+    - { id: f1, from: { node: trigger }, to: { node: auth_context } }
+    - { id: f2, from: { node: auth_context }, to: { node: quota_feature_context } }
+    - { id: f3, from: { node: quota_feature_context }, to: { node: ensure_usage_table } }
+    - { id: f4, from: { node: ensure_usage_table }, to: { node: load_usage_count } }
+    - { id: f5, from: { node: load_usage_count }, to: { node: quota_gate } }
+    - { id: f6, from: { node: quota_gate }, to: { node: call_ai_stream }, condition: "quota_gate.allowed", priority: 20 }
+    - { id: f7, from: { node: quota_gate }, to: { node: quota_exceeded_response }, condition: "!quota_gate.allowed", priority: 10 }
+    - { id: f8, from: { node: quota_exceeded_response }, to: { node: respond } }
+    - { id: f9, from: { node: call_ai_stream }, to: { node: respond } }
+    - { id: f10, from: { node: respond }, to: { node: end } }
+
+    # Detached branch: usage accounting is a background side effect. It is
+    # attached to call_ai_stream so it can run after an accepted stream without
+    # requiring a post-stream Transform that reads the full response body.
+    - { id: f11, from: { node: call_ai_stream }, to: { node: insert_usage_tracking }, detached: true }
+    - { id: f12, from: { node: insert_usage_tracking }, to: { node: usage_end } }

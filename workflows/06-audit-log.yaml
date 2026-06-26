@@ -1,0 +1,114 @@
+version: "3.0"
+metadata:
+  id: kelompok3-umkm-audit-log
+  name: "UMKM - Audit Log"
+  active: true
+  description: |
+    Workflow 6. Mencatat rekam jejak histori (audit trail) ke tabel audit_log.
+    Dipanggil sebagai detached edge (fire-and-forget) dari Workflow 1/3/4/5
+    sehingga tidak pernah memblokir respons ke pelanggan/kasir.
+  dialect: vflow
+  tags: [kelompok3, umkm, audit, postgres, detached, p1]
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        runtime_mode: standard
+        webhook_config: { path: /webhook/kelompok3/umkm/internal/audit-log, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    # Pemetaan struktur telemetri sebelum INSERT.
+    - id: map_telemetry
+      activity_type: Transform
+      input_mappings:
+        - target: log_entry
+          source:
+            language: v-cel
+            source: >-
+              {"pesanan_id": trigger_payload.pesanan_id,
+               "aktor_id": trigger_payload.aktor_id,
+               "aktivitas_tipe": trigger_payload.aktivitas_tipe,
+               "payload_log": trigger_payload.payload_log,
+               "waktu_kejadian": trigger_payload.waktu_kejadian}
+      output_variable: log_entry
+
+    - id: insert_audit_log
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: "pack://kelompok3-umkm/primary"
+        operation: raw_query
+        timeout_ms: 3000
+        retry_policy:
+          max_attempts: 2
+          base_delay_ms: 100
+          max_delay_ms: 500
+          backoff_factor: 2.0
+      input_mappings:
+        - target: query
+          source:
+            language: vil_query
+            dialect: postgres
+            source: |
+              insert("audit_log")
+                .insert_columns("pesanan_id, aktor_id, aktivitas_tipe")
+                .value(log_entry.pesanan_id)
+                .value(log_entry.aktor_id)
+                .value(log_entry.aktivitas_tipe)
+      output_variable: insert_result
+
+    - id: shape_success
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: literal
+            source: '{"status": "SUCCESS"}'
+      output_variable: final_response
+
+    - id: shape_rejected
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: literal
+            source: '{"status": "REJECTED", "code": "INVALID_AUDIT_PAYLOAD"}'
+      output_variable: rejected_response
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.final_response" }
+
+    - id: respond-rejected
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.rejected_response" }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: map_telemetry } }
+    - { id: f03, from: { node: map_telemetry }, to: { node: insert_audit_log } }
+    - { id: f04, from: { node: insert_audit_log }, to: { node: shape_success } }
+    - { id: f05, from: { node: shape_success }, to: { node: respond } }
+    - { id: f06, type: error, from: { node: map_telemetry }, to: { node: shape_rejected } }
+    - { id: f07, type: error, from: { node: insert_audit_log }, to: { node: shape_rejected } }
+    - { id: f07b, from: { node: shape_rejected }, to: { node: respond-rejected } }
+    - { id: f08, from: { node: respond }, to: { node: end } }
+    - { id: f09, from: { node: respond-rejected }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: log_entry, type: object }
+    - { name: insert_result, type: object }
+    - { name: final_response, type: object }
+    - { name: rejected_response, type: object }

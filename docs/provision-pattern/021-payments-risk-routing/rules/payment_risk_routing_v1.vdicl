@@ -1,0 +1,49 @@
+schema_ref:
+  path: "../schemas/payment_risk_fact_v1.yaml"
+  namespace: "examples.payments"
+  entity: "payment_risk_fact"
+  version: 1
+hit_policy: PRIORITY
+rules:
+  - id: "PAYMENT_BLOCKED_CATEGORY"
+    priority: 0
+    enabled: true
+    description: "Reject categories that are explicitly blocked by the merchant risk policy."
+    when: "trigger_payload.body.merchant_category == 'blocked'"
+    then:
+      - kind: EMIT
+        severity: ERROR
+        code: "PAYMENT_BLOCKED_CATEGORY"
+        field: "trigger_payload.body.merchant_category"
+        msg: "Merchant category is blocked"
+      - kind: ADD_SCORE
+        score_delta: 100
+      - kind: SET_DECISION
+        decision: REJECT
+
+  - id: "PAYMENT_STEP_UP_CROSS_BORDER_OR_HIGH_VALUE"
+    priority: 10
+    enabled: true
+    description: "Require cardholder challenge for high-value or cross-border payments."
+    when: "trigger_payload.body.amount >= 20000000 OR trigger_payload.body.country != 'ID'"
+    then:
+      - kind: EMIT
+        severity: WARN
+        code: "PAYMENT_STEP_UP_REQUIRED"
+        field: "trigger_payload.body.amount"
+        msg: "Step-up authentication required"
+      - kind: ADD_SCORE
+        score_delta: 40
+      - kind: SET_DECISION
+        decision: CHALLENGE_MFA
+
+  - id: "PAYMENT_STANDARD_APPROVE"
+    priority: 100
+    enabled: true
+    description: "Approve standard low-risk payments."
+    when: "trigger_payload.body.amount >= 1"
+    then:
+      - kind: ADD_SCORE
+        score_delta: 0
+      - kind: SET_DECISION
+        decision: ACCEPT

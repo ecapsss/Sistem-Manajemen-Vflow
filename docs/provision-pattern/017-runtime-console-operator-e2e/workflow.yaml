@@ -1,0 +1,45 @@
+version: "3.0"
+metadata:
+  id: runtime-console-operator-e2e
+  name: "P0 Runtime console operator E2E target"
+  description: |
+    Safe workflow used by runtime-smoke/runtime-console-operator-e2e.sh.
+    The smoke uploads this workflow through the runtime-local REST console,
+    activates it, validates route controls, checks artifact/gRPC endpoints,
+    and removes the workflow again when write access is enabled.
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        webhook_config: { path: /examples/runtime-console-e2e, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: normalize
+      activity_type: Transform
+      input_mappings:
+        - target: message
+          source: { language: literal, source: "runtime console e2e ok" }
+        - target: request_id
+          source: { language: spv1, source: '$.trigger_payload.headers.x-request-id' }
+      output_variable: result
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response:
+          language: spv1
+          source: '$.result'
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f1, from: { node: trigger }, to: { node: normalize } }
+    - { id: f2, from: { node: normalize }, to: { node: respond } }
+    - { id: f3, from: { node: respond }, to: { node: end } }

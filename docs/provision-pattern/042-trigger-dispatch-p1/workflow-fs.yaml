@@ -1,0 +1,38 @@
+version: "3.0"
+metadata:
+  id: p1-trigger-dispatch-fs
+  name: "P1 filesystem trigger dispatch"
+  description: |
+    Runtime contract: fs watcher receives a local file arrival event and dispatches
+    it through the kernel into a normal HTTP connector side effect.
+
+spec:
+  activities:
+    - id: fs_in
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: fs
+        route: /examples/p1/triggers/fs
+        fs:
+          watch_path: "__WATCH_DIR__"
+      output_variable: trigger_payload
+
+    - id: capture
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+        timeout_ms: 3000
+      input_mappings:
+        - target: url
+          source: { language: literal, source: "__CAPTURE_URL__/events/fs" }
+        - target: body
+          source: { language: v-cel, source: "trigger_payload" }
+      output_variable: capture_result
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f1, from: { node: fs_in }, to: { node: capture } }
+    - { id: f2, from: { node: capture }, to: { node: end } }

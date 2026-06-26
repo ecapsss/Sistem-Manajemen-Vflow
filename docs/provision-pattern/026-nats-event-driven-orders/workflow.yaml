@@ -1,0 +1,65 @@
+version: "3.0"
+metadata:
+  id: nats-event-driven-orders
+  name: "NATS Event Driven Orders"
+  description: |
+    Order event workflow. It subscribes to `examples.orders.created` through a
+    NATS trigger, normalizes the event, publishes an accepted status event, and
+    terminates without any HTTP dashboard involvement.
+  dialect: vflow
+  tags: [example, p0, nats, event-driven, connector, trigger]
+
+spec:
+  activities:
+    - id: order_created
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: nats
+        route: /examples/nats/orders/created
+        nats:
+          urls: "env://VFLOW_NATS_TEST_URL"
+          subject: "examples.orders.created"
+          queue_group: "vflow-examples-orders"
+      output_variable: trigger_payload
+
+    - id: normalize_event
+      activity_type: Transform
+      input_mappings:
+        - target: event
+          source:
+            language: v-cel
+            source: '{"order_id": trigger_payload.body.order_id, "customer_id": trigger_payload.body.customer_id, "currency": trigger_payload.body.currency, "amount_cents": trigger_payload.body.amount_cents, "source_subject": trigger_payload.subject}'
+      output_variable: order_event
+
+    - id: publish_status
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.nats
+        operation: publish
+        timeout_ms: 3000
+      input_mappings:
+        - target: subject
+          source: { language: literal, source: "examples.orders.status" }
+        - target: headers
+          source:
+            language: v-cel
+            source: '{"Nats-Event-Type": "order.accepted", "Nats-Source": "vflow.examples"}'
+        - target: payload
+          source:
+            language: v-cel
+            source: '{"status": "accepted", "order_id": order_event.order_id, "customer_id": order_event.customer_id, "currency": order_event.currency, "amount_cents": order_event.amount_cents}'
+      output_variable: publish_result
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: order_created }, to: { node: normalize_event } }
+    - { id: f02, from: { node: normalize_event }, to: { node: publish_status } }
+    - { id: f03, from: { node: publish_status }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: order_event, type: object }
+    - { name: publish_result, type: object }

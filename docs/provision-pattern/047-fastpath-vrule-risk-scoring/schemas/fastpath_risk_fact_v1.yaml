@@ -1,0 +1,42 @@
+version: 1
+namespace: examples.fastpath
+schema_version: 1
+domain: payments
+entity: fastpath_risk_fact
+
+# Phase 2 gRPC-native input. When the same compiled pack is evaluated
+# against an inbound `examples.RiskRequest` protobuf message (e.g.
+# workflow `060-standard-vrule-risk-scoring-grpc`), V-Rule walks the
+# message's field-number chains directly — no JSON intermediate.
+# Webhook workflows (047, 049, 052, ...) continue to evaluate via the
+# JSON path; the proto binding is harmless metadata for them.
+bind_proto: examples.RiskRequest
+
+# Phase 3 gRPC-native output. When V-Rule's proto-input path runs AND
+# this descriptor is in the proto registry, the rule output (decision,
+# total_score, findings_count) is encoded into an
+# `examples.RiskResponse` message and written to the V-Rule activity's
+# output variable as raw protobuf bytes. EndTrigger `bytes_ref` reads
+# them with zero conversion. Workflows that emit JSON output (049 etc.)
+# ignore this — the proto encode only fires on the proto path.
+output_proto_schema: examples.RiskResponse
+
+fields:
+  - path: amount
+    scalar: F64
+    nullable: false
+  - path: country
+    scalar: SYM
+    nullable: false
+  - path: card_bin
+    scalar: SYM
+    nullable: false
+  - path: merchant_category
+    scalar: SYM
+    nullable: false
+  - path: customer_tier
+    scalar: SYM
+    nullable: false
+  - path: velocity_1h
+    scalar: F64
+    nullable: false

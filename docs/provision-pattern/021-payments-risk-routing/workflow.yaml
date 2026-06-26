@@ -1,0 +1,195 @@
+version: "3.0"
+metadata:
+  id: payments-risk-routing
+  name: "Payments Risk Routing"
+  description: |
+    Payment authorization workflow. Validates payment input, delegates decision
+    to a VDICL rule set, routes to authorize, step-up, or decline, and documents
+    retry side-effect semantics.
+  dialect: vflow
+  tags: [example, p0, payments, vrule, retry, side-effect]
+
+spec:
+  settings:
+    rate_limits:
+      payments-auth-100rpm:
+        window: 60s
+        max_requests: 100
+
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        route: /examples/payments/authorize
+        webhook_config: { path: /examples/payments/authorize, method: POST }
+        webhook:
+          method: POST
+          rate_limit: payments-auth-100rpm
+        response_framing: length_prefixed
+        end_activity: respond-authorized
+      output_variable: trigger_payload
+
+    - id: validate_payment
+      activity_type: Validate
+      validate_config:
+        input: "$.trigger_payload.body"
+        schema:
+          required: [payment_id, idempotency_key, amount, currency, card_bin, country, merchant_category]
+          properties:
+            payment_id: { type: string, min_length: 3 }
+            idempotency_key: { type: string, min_length: 8 }
+            amount: { type: number, min: 1 }
+            currency: { type: string, min_length: 3, max_length: 3 }
+            card_bin: { type: string, min_length: 6, max_length: 8 }
+            country: { type: string, min_length: 2, max_length: 2 }
+            merchant_category: { type: string, min_length: 2 }
+      output_variable: validated_payment
+
+    - id: risk_rules
+      activity_type: VRule
+      rule_config:
+        tenant_id: examples
+        rule_set_id: payment_risk_routing_v1
+        version_policy: latest
+      input_mappings:
+        - target: amount
+          source: { language: spv1, source: "$.trigger_payload.body.amount" }
+        - target: country
+          source: { language: spv1, source: "$.trigger_payload.body.country" }
+        - target: card_bin
+          source: { language: spv1, source: "$.trigger_payload.body.card_bin" }
+        - target: merchant_category
+          source: { language: spv1, source: "$.trigger_payload.body.merchant_category" }
+      output_variable: risk_result
+
+    - id: decision
+      activity_type: Exclusive
+      description: "Risk result decides whether to authorize, step up, or decline."
+
+    - id: authorize_payment
+      activity_type: Connector
+      persistence: ssot
+      description: "Side-effecting payment rail call. Requires idempotency_key."
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+        timeout_ms: 3000
+        retry_policy:
+          max_attempts: 2
+          base_delay_ms: 200
+          max_delay_ms: 1000
+          backoff_factor: 2.0
+      input_mappings:
+        - target: url
+          source: { language: literal, source: "http://127.0.0.1:18021/payments/authorize" }
+        - target: body
+          source:
+            language: v-cel
+            source: '{"payment_id": trigger_payload.body.payment_id, "idempotency_key": trigger_payload.body.idempotency_key, "amount": trigger_payload.body.amount, "currency": trigger_payload.body.currency}'
+      output_variable: authorization
+
+    - id: step_up_challenge
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+        timeout_ms: 3000
+      input_mappings:
+        - target: url
+          source: { language: literal, source: "http://127.0.0.1:18021/payments/3ds/challenge" }
+        - target: body
+          source:
+            language: v-cel
+            source: '{"payment_id": trigger_payload.body.payment_id, "idempotency_key": trigger_payload.body.idempotency_key, "amount": trigger_payload.body.amount}'
+      output_variable: challenge
+
+    - id: authorized_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"status": "authorized", "payment_id": trigger_payload.body.payment_id, "authorization": authorization, "retry_warning": "operator retry reuses current active workflow version and must preserve idempotency_key"}'
+      output_variable: authorized_response
+
+    - id: step_up_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"status": "challenge_required", "payment_id": trigger_payload.body.payment_id, "challenge": challenge}'
+      output_variable: step_up_response
+
+    - id: declined_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"status": "declined", "payment_id": trigger_payload.body.payment_id, "reason": risk_result.decision, "risk": risk_result}'
+      output_variable: declined_response
+
+    - id: failed_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: literal
+            source: '{"status":"authorization_failed","reason":"payment_rail_error"}'
+      output_variable: failed_response
+
+    - id: respond-authorized
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.authorized_response" }
+
+    - id: respond-step-up
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.step_up_response" }
+
+    - id: respond-declined
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.declined_response" }
+
+    - id: respond-failed
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.failed_response" }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: validate_payment } }
+    - { id: f02, from: { node: validate_payment }, to: { node: risk_rules } }
+    - { id: f03, from: { node: risk_rules }, to: { node: decision } }
+    - { id: f04, from: { node: decision }, to: { node: authorize_payment }, condition: 'risk_result.decision == "ACCEPT"', priority: 30 }
+    - { id: f05, from: { node: decision }, to: { node: step_up_challenge }, condition: 'risk_result.decision == "CHALLENGE_MFA"', priority: 20 }
+    - { id: f06, from: { node: decision }, to: { node: declined_response }, type: default, priority: 0 }
+    - { id: f07, from: { node: authorize_payment }, to: { node: authorized_response } }
+    - { id: f08, from: { node: step_up_challenge }, to: { node: step_up_response } }
+    - { id: f09, type: error, from: { node: authorize_payment }, to: { node: failed_response } }
+    - { id: f10, type: error, from: { node: step_up_challenge }, to: { node: failed_response } }
+    - { id: f11, from: { node: authorized_response }, to: { node: respond-authorized } }
+    - { id: f12, from: { node: step_up_response }, to: { node: respond-step-up } }
+    - { id: f13, from: { node: declined_response }, to: { node: respond-declined } }
+    - { id: f14, from: { node: failed_response }, to: { node: respond-failed } }
+    - { id: f15, from: { node: respond-authorized }, to: { node: end } }
+    - { id: f16, from: { node: respond-step-up }, to: { node: end } }
+    - { id: f17, from: { node: respond-declined }, to: { node: end } }
+    - { id: f18, from: { node: respond-failed }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: risk_result, type: object }
+    - { name: authorization, type: object }
+    - { name: challenge, type: object }

@@ -1,0 +1,39 @@
+{
+  "product": "Workflow Declaration Guide",
+  "sections": [
+    {
+      "title": "Start Here",
+      "items": [
+        { "slug": "00-overview", "title": "Overview" },
+        { "slug": "01-schema", "title": "Workflow Schema" },
+        { "slug": "02-activities", "title": "Activity Nodes" }
+      ]
+    },
+    {
+      "title": "Runtime I/O",
+      "items": [
+        { "slug": "04-triggers", "title": "Triggers" },
+        { "slug": "03-connectors", "title": "Connectors" },
+        { "slug": "05-expressions", "title": "Expressions" },
+        { "slug": "09-quick-transform", "title": "Quick Transform" }
+      ]
+    },
+    {
+      "title": "Advanced Runtime Features",
+      "items": [
+        { "slug": "10-vcel-transform", "title": "V-CEL" },
+        { "slug": "11-vrule-vdicl", "title": "V-Rule and VDICL" },
+        { "slug": "12-compute-activity", "title": "Compute and Starlark" },
+        { "slug": "13-audit-log", "title": "Audit Envelopes" }
+      ]
+    },
+    {
+      "title": "Packaging and Operations",
+      "items": [
+        { "slug": "06-pack-tier", "title": "Packs and Tiers" },
+        { "slug": "08-iac-resources", "title": "IaC Resources" },
+        { "slug": "07-examples", "title": "Examples" }
+      ]
+    }
+  ]
+}

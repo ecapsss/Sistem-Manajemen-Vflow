@@ -1,0 +1,24 @@
+version: 1
+namespace: kelompok3.umkm.harga
+schema_version: 1
+domain: pesanan
+entity: harga_fact
+
+# Fact yang dievaluasi oleh rule pack kelompok3_aturan_harga_umkm_v1.
+# Dipetakan dari trigger_payload.body pada Workflow 3 (Kalkulasi Total Tagihan).
+fields:
+  - path: subtotal
+    scalar: F64
+    nullable: false
+  - path: total_item
+    scalar: I64
+    nullable: false
+  - path: tipe_pelanggan
+    scalar: SYM
+    nullable: false
+  - path: metode_pembayaran
+    scalar: SYM
+    nullable: false
+  - path: metode_pengambilan
+    scalar: SYM
+    nullable: false

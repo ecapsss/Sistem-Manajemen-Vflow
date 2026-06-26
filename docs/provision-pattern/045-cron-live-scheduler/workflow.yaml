@@ -1,0 +1,53 @@
+version: "3.0"
+metadata:
+  id: cron-live-scheduler
+  name: "Cron Live Scheduler"
+  description: |
+    Local-safe cron trigger smoke. A short scheduler tick enters the workflow
+    and is sent to a local HTTP capture service.
+  dialect: vflow
+  tags: [example, trigger, cron, runtime-smoke]
+
+spec:
+  activities:
+    - id: cron_tick
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: cron
+        route: /examples/cron/live
+        cron:
+          expression: "100ms"
+      output_variable: trigger_payload
+
+    - id: notify_capture
+      activity_type: Connector
+      persistence: skip
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+      input_mappings:
+        - target: url
+          source: { language: literal, source: "__CAPTURE_URL__/events/cron" }
+        - target: method
+          source: { language: literal, source: "POST" }
+        - target: body
+          source:
+            language: v-cel
+            source: |
+              {
+                "trigger": trigger_payload._trigger,
+                "schedule": trigger_payload._schedule,
+                "fired_at": trigger_payload._fired_at
+              }
+      output_variable: capture_result
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: cron_tick }, to: { node: notify_capture } }
+    - { id: f02, from: { node: notify_capture }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: capture_result, type: object }

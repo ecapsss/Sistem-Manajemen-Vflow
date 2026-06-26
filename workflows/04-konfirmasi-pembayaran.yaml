@@ -1,0 +1,120 @@
+version: "3.0"
+metadata:
+  id: kelompok3-umkm-konfirmasi-pembayaran
+  name: "UMKM - Konfirmasi Pembayaran"
+  active: true
+  description: |
+    Workflow 4. Memvalidasi nominal pembayaran yang diserahkan pelanggan
+    terhadap total tagihan, menghitung kembalian, dan menandai pesanan
+    'lunas' bila cukup. Menyentuh DB (UPDATE status) -> runtime standard.
+  dialect: vflow
+  tags: [kelompok3, umkm, pembayaran, postgres, p0]
+
+spec:
+  durability:
+    enabled: true
+    default_mode: eventual
+
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        runtime_mode: standard
+        webhook_config: { path: /webhook/kelompok3/umkm/pesanan/konfirmasi-pembayaran, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: hitung_kembalian
+      activity_type: Transform
+      input_mappings:
+        - target: hasil
+          source:
+            language: v-cel
+            source: >-
+              {"kembalian": trigger_payload.nominal_dibayar - trigger_payload.total_tagihan,
+               "cukup": trigger_payload.nominal_dibayar >= trigger_payload.total_tagihan}
+      output_variable: kembalian_result
+
+    - id: gate_nominal
+      activity_type: ExclusiveGateway
+      description: "Cabang: nominal_dibayar cukup -> tandai lunas; tidak cukup -> tolak."
+
+    - id: update_status_lunas
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: "pack://kelompok3-umkm/primary"
+        operation: raw_query
+        timeout_ms: 3000
+        retry_policy:
+          max_attempts: 2
+          base_delay_ms: 100
+          max_delay_ms: 500
+          backoff_factor: 2.0
+      input_mappings:
+        - target: query
+          source:
+            language: vil_query
+            dialect: postgres
+            source: |
+              update("pesanan")
+                .set("status", "lunas")
+                .set("total_tagihan", trigger_payload.total_tagihan)
+                .set_raw("updated_at", "now()")
+                .where_raw_bind("id = ?::int", trigger_payload.pesanan_id)
+      output_variable: update_result
+
+    - id: shape_lunas
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"status_pembayaran": "lunas", "kembalian": kembalian_result.kembalian, "pesanan_id": trigger_payload.pesanan_id}'
+      output_variable: response
+
+    - id: shape_kurang
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"status_pembayaran": "kurang_bayar", "kembalian": 0, "kekurangan": trigger_payload.total_tagihan - trigger_payload.nominal_dibayar, "pesanan_id": trigger_payload.pesanan_id}'
+      output_variable: response
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.response" }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: hitung_kembalian } }
+    - { id: f02, from: { node: hitung_kembalian }, to: { node: gate_nominal } }
+
+    - id: f03
+      from: { node: gate_nominal }
+      to: { node: update_status_lunas }
+      condition: "kembalian_result.cukup"
+      priority: 10
+
+    - id: f04
+      from: { node: gate_nominal }
+      to: { node: shape_kurang }
+      priority: 0
+
+    - { id: f05, from: { node: update_status_lunas }, to: { node: shape_lunas } }
+    - { id: f06, from: { node: shape_lunas }, to: { node: respond } }
+    - { id: f07, from: { node: shape_kurang }, to: { node: respond } }
+    - { id: f08, from: { node: respond }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: kembalian_result, type: object }
+    - { name: update_result, type: object }
+    - { name: response, type: object }

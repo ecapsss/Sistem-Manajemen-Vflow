@@ -1,0 +1,42 @@
+version: "3.0"
+metadata:
+  id: p1-trigger-dispatch-nats-kv
+  name: "P1 NATS KV trigger dispatch"
+  description: |
+    Runtime contract: JetStream KV watcher receives a distributed bucket update
+    and dispatches it through the kernel into a normal HTTP connector side effect.
+
+spec:
+  activities:
+    - id: nats_kv_in
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: nats_kv
+        route: /examples/p1/triggers/nats-kv
+        nats_kv:
+          urls: "__NATS_URL__"
+          bucket: "__NATS_KV_BUCKET__"
+          key_prefix: "__NATS_KV_PREFIX__"
+      output_variable: trigger_payload
+
+    - id: capture
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+        timeout_ms: 3000
+      input_mappings:
+        - target: url
+          source: { language: literal, source: "__CAPTURE_URL__/events/nats-kv" }
+        - target: body
+          source:
+            language: v-cel
+            source: "trigger_payload.body"
+      output_variable: capture_result
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f1, from: { node: nats_kv_in }, to: { node: capture } }
+    - { id: f2, from: { node: capture }, to: { node: end } }

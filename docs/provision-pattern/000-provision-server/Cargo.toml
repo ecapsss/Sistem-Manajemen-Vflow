@@ -1,0 +1,21 @@
+[workspace]
+
+[package]
+name = "vflow-example-provision-server"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Minimal provision-server entry point — zero compile-time handlers, everything admin-API"
+
+[dependencies]
+vflow_server = { path = "../../../crates/vflow_server" }
+tokio = { version = "1", features = ["full"] }
+vil_log = { path = "../../../crates/vil_log" }
+
+[features]
+default = []
+# Forward-link to vflow_server's p420_statestore feature so this
+# provision-server binary picks up the boot-time resurrection scan +
+# `execute_wired_resumed` spawn path.
+p420_statestore = ["vflow_server/p420_statestore"]

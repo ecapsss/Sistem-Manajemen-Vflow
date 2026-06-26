@@ -1,0 +1,183 @@
+# Rule Pack: kelompok3_aturan_harga_umkm_v1
+#
+# Dipakai oleh Workflow 3 (Kalkulasi Total Tagihan). Mengelola seluruh
+# konvensi bisnis kalkulasi nilai finansial pesanan UMKM:
+#   - diskon bertingkat (member/grosir)
+#   - biaya admin per metode pembayaran
+#   - biaya pengiriman per metode pengambilan
+#
+# hit_policy: COLLECT -> setiap kategori (diskon, biaya_admin, biaya_pengiriman)
+# dievaluasi independen oleh rule-rule yang berbeda; semua rule yang cocok
+# dieksekusi dan masing-masing menulis ke field outputnya sendiri.
+# output_conflict_policy: LWW -> bila dua rule diskon sama-sama cocok
+# (mis. member DAN grosir), rule yang dievaluasi terakhir (document order)
+# menang -> taruh rule diskon terbesar di bagian paling bawah kelompoknya.
+
+version: 1
+decision_id: kelompok3_aturan_harga_umkm_v1
+decision_name: "Aturan Harga UMKM"
+schema_ref:
+  path: "../schemas/harga_fact_v1.yaml"
+  namespace: "kelompok3.umkm.harga"
+  entity: "harga_fact"
+  version: 1
+
+hit_policy: COLLECT
+output_conflict_policy: LWW
+
+rules:
+  # ---------------------------------------------------------------------
+  # KELOMPOK 1 — DISKON (bertingkat: reguler -> member -> grosir)
+  # Ditaruh berurutan dari yang paling kecil ke paling besar supaya pada
+  # kasus tumpang-tindih, LWW memilih diskon paling menguntungkan pelanggan.
+  # ---------------------------------------------------------------------
+  - id: "DISKON_REGULER_DEFAULT"
+    priority: 0
+    enabled: true
+    description: "Default: pelanggan reguler tidak mendapat diskon."
+    when: 'tipe_pelanggan == "reguler"'
+    then:
+      - kind: EVAL_SET_FIELD
+        path: diskon
+        expr: "0"
+
+  - id: "DISKON_MEMBER"
+    priority: 10
+    enabled: true
+    description: "Member mendapat diskon 5% dari subtotal."
+    when: 'tipe_pelanggan == "member"'
+    then:
+      - kind: EVAL_SET_FIELD
+        path: diskon
+        expr: "ROUND(subtotal * 0.05, 0)"
+      - kind: EMIT
+        severity: INFO
+        code: "DISKON_MEMBER_APPLIED"
+        field: "tipe_pelanggan"
+        msg: "Diskon member 5% diterapkan"
+
+  - id: "DISKON_GROSIR"
+    priority: 20
+    enabled: true
+    description: "Pembelian grosir (>= 20 item) mendapat diskon 10% dari subtotal, menggantikan diskon member jika berlaku bersamaan."
+    when: "total_item >= 20"
+    then:
+      - kind: EVAL_SET_FIELD
+        path: diskon
+        expr: "ROUND(subtotal * 0.10, 0)"
+      - kind: EMIT
+        severity: INFO
+        code: "DISKON_GROSIR_APPLIED"
+        field: "total_item"
+        msg: "Diskon grosir 10% diterapkan (jumlah item >= 20)"
+
+  # ---------------------------------------------------------------------
+  # KELOMPOK 2 — BIAYA ADMIN (berdasarkan metode_pembayaran)
+  # ---------------------------------------------------------------------
+  - id: "ADMIN_TUNAI"
+    priority: 0
+    enabled: true
+    description: "Pembayaran tunai tidak dikenakan biaya admin."
+    when: 'metode_pembayaran == "tunai"'
+    then:
+      - kind: EVAL_SET_FIELD
+        path: biaya_admin
+        expr: "0"
+
+  - id: "ADMIN_QRIS"
+    priority: 0
+    enabled: true
+    description: "Pembayaran QRIS dikenakan biaya admin 0,7% dari subtotal."
+    when: 'metode_pembayaran == "qris"'
+    then:
+      - kind: EVAL_SET_FIELD
+        path: biaya_admin
+        expr: "ROUND(subtotal * 0.007, 0)"
+
+  - id: "ADMIN_EWALLET"
+    priority: 0
+    enabled: true
+    description: "Pembayaran e-wallet dikenakan biaya admin flat Rp1.500."
+    when: 'metode_pembayaran == "ewallet"'
+    then:
+      - kind: EVAL_SET_FIELD
+        path: biaya_admin
+        expr: "1500"
+
+  - id: "ADMIN_KARTU_DEBIT_KREDIT"
+    priority: 0
+    enabled: true
+    description: "Pembayaran kartu debit/kredit dikenakan biaya admin 1,5% dari subtotal."
+    when: 'metode_pembayaran == "kartu"'
+    then:
+      - kind: EVAL_SET_FIELD
+        path: biaya_admin
+        expr: "ROUND(subtotal * 0.015, 0)"
+      - kind: EMIT
+        severity: WARN
+        code: "ADMIN_KARTU_HIGH_FEE"
+        field: "metode_pembayaran"
+        msg: "Biaya admin kartu lebih tinggi dibanding QRIS/tunai"
+
+  # ---------------------------------------------------------------------
+  # KELOMPOK 3 — BIAYA PENGIRIMAN (berdasarkan metode_pengambilan)
+  # ---------------------------------------------------------------------
+  - id: "KIRIM_AMBIL_SENDIRI"
+    priority: 0
+    enabled: true
+    description: "Pelanggan ambil sendiri di toko: tidak ada biaya pengiriman."
+    when: 'metode_pengambilan == "ambil_sendiri"'
+    then:
+      - kind: EVAL_SET_FIELD
+        path: biaya_pengiriman
+        expr: "0"
+
+  - id: "KIRIM_INSTANT"
+    priority: 0
+    enabled: true
+    description: "Pengiriman instan (same-day) dikenakan biaya flat Rp15.000."
+    when: 'metode_pengambilan == "instant"'
+    then:
+      - kind: EVAL_SET_FIELD
+        path: biaya_pengiriman
+        expr: "15000"
+
+  - id: "KIRIM_REGULER_FREE"
+    priority: 0
+    enabled: true
+    description: "Pengiriman reguler gratis bila subtotal sudah >= Rp200.000."
+    when: 'metode_pengambilan == "reguler" AND subtotal >= 200000'
+    then:
+      - kind: EVAL_SET_FIELD
+        path: biaya_pengiriman
+        expr: "0"
+      - kind: EMIT
+        severity: INFO
+        code: "FREE_ONGKIR_APPLIED"
+        field: "subtotal"
+        msg: "Gratis ongkir reguler diterapkan (subtotal >= Rp200.000)"
+
+  - id: "KIRIM_REGULER_FLAT"
+    priority: 0
+    enabled: true
+    description: "Pengiriman reguler dikenakan biaya flat Rp8.000 bila subtotal < Rp200.000."
+    when: 'metode_pengambilan == "reguler" AND subtotal < 200000'
+    then:
+      - kind: EVAL_SET_FIELD
+        path: biaya_pengiriman
+        expr: "8000"
+
+  # ---------------------------------------------------------------------
+  # KELOMPOK 4 — GUARD / VALIDASI BISNIS TAMBAHAN
+  # ---------------------------------------------------------------------
+  - id: "GUARD_SUBTOTAL_INVALID"
+    priority: 100
+    enabled: true
+    description: "Tandai (finding) bila subtotal nol atau negatif; kalkulasi tetap berjalan, keputusan akhir tetap di tangan backend/operator."
+    when: "subtotal <= 0"
+    then:
+      - kind: EMIT
+        severity: ERROR
+        code: "SUBTOTAL_INVALID"
+        field: "subtotal"
+        msg: "Subtotal harus lebih besar dari 0"

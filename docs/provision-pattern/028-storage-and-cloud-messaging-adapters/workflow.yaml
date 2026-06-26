@@ -1,0 +1,263 @@
+version: "3.0"
+metadata:
+  id: storage-and-cloud-messaging-adapters
+  name: "Storage and Cloud Messaging Adapters"
+  description: |
+    Billing archive workflow that demonstrates storage adapter writes and
+    downstream messaging fanout. Runtime execution is local/lab-infra scoped:
+    S3/SeaweedFS, SFTP, and NATS have skip-aware local smoke coverage; GCS,
+    Azure Blob, Kafka, MQTT, RabbitMQ, Pulsar, Pub/Sub, and SQS are declared as
+    provider/lab connector contracts.
+  dialect: vflow
+  tags: [example, p1, storage, messaging, cloud-adapters]
+
+spec:
+  durability:
+    enabled: true
+    default_mode: journal-state
+
+  activities:
+    - id: invoice_api
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        route: /examples/storage/invoices
+        webhook_config: { path: /examples/storage/invoices, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: invoice_file_event
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: s3_event
+        route: /examples/storage/invoices/s3-event
+        s3_event:
+          bucket: "vflow-examples"
+          prefix: "billing/invoices/incoming/"
+      output_variable: trigger_payload
+
+    - id: validate_invoice
+      activity_type: Validate
+      validate_config:
+        input: "$.trigger_payload.body"
+        schema:
+          required: [invoice_id, tenant_id, customer_id, total_cents, currency, idempotency_key]
+          properties:
+            invoice_id: { type: string, min_length: 3 }
+            tenant_id: { type: string, min_length: 3 }
+            customer_id: { type: string, min_length: 3 }
+            total_cents: { type: integer, minimum: 0 }
+            currency: { type: string, min_length: 3, max_length: 3 }
+            idempotency_key: { type: string, min_length: 8 }
+      output_variable: validated_invoice
+
+    - id: build_archive_context
+      activity_type: Transform
+      input_mappings:
+        - target: archive_context
+          source:
+            language: v-cel
+            source: '{"invoice_id": trigger_payload.body.invoice_id, "tenant_id": trigger_payload.body.tenant_id, "customer_id": trigger_payload.body.customer_id, "total_cents": trigger_payload.body.total_cents, "currency": trigger_payload.body.currency, "idempotency_key": trigger_payload.body.idempotency_key, "archive_key": "billing/" + trigger_payload.body.tenant_id + "/invoices/" + trigger_payload.body.invoice_id + ".json", "partner_manifest_path": "/upload/billing/" + trigger_payload.body.invoice_id + ".json", "event_subject": "examples.billing.invoice.archived"}'
+      output_variable: archive_context
+
+    - id: store_canonical_archive
+      activity_type: Connector
+      persistence: ssot
+      description: "Canonical invoice archive; retry must reuse idempotency_key and archive_key."
+      connector_config:
+        connector_ref: vastar.s3
+        operation: put_object
+      input_mappings:
+        - target: key
+          source: { language: spv1, source: "$.archive_context.archive_key" }
+        - target: body
+          source:
+            language: v-cel
+            source: '{"invoice_id": archive_context.invoice_id, "tenant_id": archive_context.tenant_id, "customer_id": archive_context.customer_id, "total_cents": archive_context.total_cents, "currency": archive_context.currency}'
+      output_variable: s3_archive
+
+    - id: mirror_to_gcs
+      activity_type: Connector
+      persistence: durable_strict
+      description: "Provider optional cloud storage mirror."
+      connector_config:
+        connector_ref: vastar.gcs
+        operation: upload
+      input_mappings:
+        - target: key
+          source: { language: spv1, source: "$.archive_context.archive_key" }
+        - target: data
+          source:
+            language: v-cel
+            source: '{"invoice_id": archive_context.invoice_id, "provider": "gcs"}'
+      output_variable: gcs_mirror
+
+    - id: mirror_to_azure_blob
+      activity_type: Connector
+      persistence: durable_strict
+      description: "Provider optional Azure Blob mirror."
+      connector_config:
+        connector_ref: vastar.azure
+        operation: upload_blob
+      input_mappings:
+        - target: blob
+          source: { language: spv1, source: "$.archive_context.archive_key" }
+        - target: data
+          source:
+            language: v-cel
+            source: '{"invoice_id": archive_context.invoice_id, "provider": "azure"}'
+      output_variable: azure_mirror
+
+    - id: drop_partner_manifest
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: vastar.sftp
+        operation: upload
+      input_mappings:
+        - target: path
+          source: { language: spv1, source: "$.archive_context.partner_manifest_path" }
+        - target: data
+          source:
+            language: v-cel
+            source: '{"invoice_id": archive_context.invoice_id, "archive_key": archive_context.archive_key, "customer_id": archive_context.customer_id}'
+      output_variable: partner_manifest
+
+    - id: publish_runtime_event
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.nats
+        operation: publish
+      input_mappings:
+        - target: subject
+          source: { language: spv1, source: "$.archive_context.event_subject" }
+        - target: payload
+          source:
+            language: v-cel
+            source: '{"invoice_id": archive_context.invoice_id, "archive_key": archive_context.archive_key, "status": "archived"}'
+      output_variable: nats_event
+
+    - id: publish_kafka_event
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.kafka
+        operation: publish
+      input_mappings:
+        - target: topic
+          source: { language: literal, source: "examples.billing.invoice.archived" }
+        - target: payload
+          source:
+            language: v-cel
+            source: '{"invoice_id": archive_context.invoice_id, "archive_key": archive_context.archive_key}'
+      output_variable: kafka_event
+
+    - id: publish_mqtt_event
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.mqtt
+        operation: publish
+      input_mappings:
+        - target: topic
+          source: { language: literal, source: "examples/billing/invoice/archived" }
+        - target: payload
+          source:
+            language: v-cel
+            source: '{"invoice_id": archive_context.invoice_id, "tenant_id": archive_context.tenant_id}'
+      output_variable: mqtt_event
+
+    - id: publish_rabbitmq_event
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.rabbitmq
+        operation: publish
+      input_mappings:
+        - target: exchange
+          source: { language: literal, source: "billing.events" }
+        - target: routing_key
+          source: { language: literal, source: "invoice.archived" }
+        - target: payload
+          source:
+            language: v-cel
+            source: '{"invoice_id": archive_context.invoice_id, "archive_key": archive_context.archive_key}'
+      output_variable: rabbitmq_event
+
+    - id: publish_pulsar_event
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.pulsar
+        operation: publish
+      input_mappings:
+        - target: payload
+          source:
+            language: v-cel
+            source: '{"invoice_id": archive_context.invoice_id, "archive_key": archive_context.archive_key}'
+      output_variable: pulsar_event
+
+    - id: publish_pubsub_event
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.pubsub
+        operation: publish
+      input_mappings:
+        - target: topic
+          source: { language: literal, source: "billing-invoice-archived" }
+        - target: payload
+          source:
+            language: v-cel
+            source: '{"invoice_id": archive_context.invoice_id, "archive_key": archive_context.archive_key}'
+      output_variable: pubsub_event
+
+    - id: send_sqs_event
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.sqs
+        operation: send
+      input_mappings:
+        - target: body
+          source:
+            language: v-cel
+            source: '{"invoice_id": archive_context.invoice_id, "archive_key": archive_context.archive_key, "idempotency_key": archive_context.idempotency_key}'
+      output_variable: sqs_event
+
+    - id: accepted_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"status": "archived", "invoice_id": archive_context.invoice_id, "archive_key": archive_context.archive_key, "partner_manifest": archive_context.partner_manifest_path, "event_subject": archive_context.event_subject}'
+      output_variable: final_response
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: invoice_api
+        final_response: { language: spv1, source: "$.final_response" }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: invoice_api }, to: { node: validate_invoice } }
+    - { id: f02, from: { node: invoice_file_event }, to: { node: validate_invoice } }
+    - { id: f03, from: { node: validate_invoice }, to: { node: build_archive_context } }
+    - { id: f04, from: { node: build_archive_context }, to: { node: store_canonical_archive } }
+    - { id: f05, from: { node: store_canonical_archive }, to: { node: mirror_to_gcs } }
+    - { id: f06, from: { node: mirror_to_gcs }, to: { node: mirror_to_azure_blob } }
+    - { id: f07, from: { node: mirror_to_azure_blob }, to: { node: drop_partner_manifest } }
+    - { id: f08, from: { node: drop_partner_manifest }, to: { node: publish_runtime_event } }
+    - { id: f09, from: { node: publish_runtime_event }, to: { node: publish_kafka_event } }
+    - { id: f10, from: { node: publish_kafka_event }, to: { node: publish_mqtt_event } }
+    - { id: f11, from: { node: publish_mqtt_event }, to: { node: publish_rabbitmq_event } }
+    - { id: f12, from: { node: publish_rabbitmq_event }, to: { node: publish_pulsar_event } }
+    - { id: f13, from: { node: publish_pulsar_event }, to: { node: publish_pubsub_event } }
+    - { id: f14, from: { node: publish_pubsub_event }, to: { node: send_sqs_event } }
+    - { id: f15, from: { node: send_sqs_event }, to: { node: accepted_response } }
+    - { id: f16, from: { node: accepted_response }, to: { node: respond } }
+    - { id: f17, from: { node: respond }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: archive_context, type: object }
+    - { name: final_response, type: object }

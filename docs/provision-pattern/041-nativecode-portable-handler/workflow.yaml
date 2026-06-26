@@ -1,0 +1,53 @@
+version: "3.0"
+metadata:
+  id: nativecode-portable-handler
+  name: "NativeCode Portable Handler"
+  description: |
+    Runtime-local executable NativeCode example. The handler is compiled as a
+    cdylib plugin and loaded from VFLOW_PLUGIN_DIR by the runtime.
+  dialect: vflow
+  tags: [example, p0, nativecode, plugin, pricing, blackbox]
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        route: /examples/native-pricing
+        webhook_config: { path: /examples/native-pricing, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: price_with_native_handler
+      activity_type: NativeCode
+      persistence: ssot
+      code_config:
+        handler_ref: portable_pricing_native
+        exec_class: async
+        timeout_ms: 5000
+      input_mappings:
+        - target: base_price_cents
+          source: { language: v-cel, source: "trigger_payload.body.base_price_cents" }
+        - target: discount_bps
+          source: { language: v-cel, source: "trigger_payload.body.discount_bps" }
+      output_variable: pricing_result
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.pricing_result" }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: price_with_native_handler } }
+    - { id: f02, from: { node: price_with_native_handler }, to: { node: respond } }
+    - { id: f03, from: { node: respond }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: pricing_result, type: object }

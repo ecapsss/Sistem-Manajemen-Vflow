@@ -1,0 +1,44 @@
+version: "3.0"
+metadata:
+  id: p1-trigger-dispatch-sftp
+  name: "P1 SFTP trigger dispatch"
+  description: |
+    Runtime contract declaration for SFTP file-arrival dispatch. The live smoke
+    is skip-aware until VFLOW_SFTP_HOST/VFLOW_SFTP_USER/VFLOW_SFTP_PASS are set.
+
+spec:
+  activities:
+    - id: sftp_in
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: sftp
+        route: /examples/p1/triggers/sftp
+        sftp:
+          host: "__SFTP_HOST__"
+          port: __SFTP_PORT__
+          username: "__SFTP_USERNAME__"
+          password: "__SFTP_PASSWORD__"
+          watch_dir: "__SFTP_WATCH_DIR__"
+          poll_interval_secs: 1
+          pattern: "*.json"
+      output_variable: trigger_payload
+
+    - id: capture
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+        timeout_ms: 3000
+      input_mappings:
+        - target: url
+          source: { language: literal, source: "__CAPTURE_URL__/events/sftp" }
+        - target: body
+          source: { language: v-cel, source: "trigger_payload" }
+      output_variable: capture_result
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f1, from: { node: sftp_in }, to: { node: capture } }
+    - { id: f2, from: { node: capture }, to: { node: end } }

@@ -1,0 +1,123 @@
+version: "3.0"
+metadata:
+  id: kelompok3-umkm-buka-keranjang
+  name: "UMKM - Buka Keranjang Pesanan"
+  active: true
+  description: |
+    Workflow 1. Membuat transaksi baru (pesanan) dengan status 'draft' sebelum
+    pelanggan mulai berbelanja. Dipanggil oleh Node.js Express setelah payload
+    lolos validasi awal (API key + Joi schema).
+  dialect: vflow
+  tags: [kelompok3, umkm, pesanan, draft, postgres, p0]
+
+spec:
+  durability:
+    enabled: true
+    default_mode: eventual
+
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        runtime_mode: standard
+        webhook_config: { path: /webhook/kelompok3/umkm/pesanan/buka, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: insert_pesanan
+      activity_type: Connector
+      persistence: ssot
+      connector_config:
+        connector_ref: "pack://kelompok3-umkm/primary"
+        operation: raw_query
+        timeout_ms: 8000
+        retry_policy:
+          max_attempts: 2
+          base_delay_ms: 100
+          max_delay_ms: 500
+          backoff_factor: 2.0
+      input_mappings:
+        - target: query
+          source:
+            language: vil_query
+            dialect: postgres
+            source: |
+              insert("pesanan")
+                .insert_columns("pelanggan_id, kasir_id, status, subtotal, total_tagihan")
+                .value(trigger_payload.pelanggan_id)
+                .value(trigger_payload.kasir_id)
+                .value("draft")
+                .value(0)
+                .value(0)
+      output_variable: insert_result
+
+    - id: select_pesanan_baru
+      activity_type: Connector
+      connector_config:
+        connector_ref: "pack://kelompok3-umkm/primary"
+        operation: raw_query
+        timeout_ms: 8000
+      input_mappings:
+        - target: query
+          source:
+            language: vil_query
+            dialect: postgres
+            source: |
+              select("pesanan")
+                .columns("id, status")
+                .where_eq("kasir_id", trigger_payload.kasir_id)
+                .where_eq("status", "draft")
+                .order_by("id DESC")
+                .limit(1)
+      output_variable: pesanan_result
+
+    - id: shape_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: v-cel
+            source: '{"pesanan_id": pesanan_result.rows[0].id, "status": pesanan_result.rows[0].status}'
+      output_variable: final_response
+
+    - id: rejected_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: literal
+            source: '{"status":"rejected","code":"INVALID_PAYLOAD","message":"pelanggan_id numerik dan kasir_id wajib diisi"}'
+      output_variable: rejected_response
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.final_response" }
+
+    - id: respond-rejected
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.rejected_response" }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: insert_pesanan } }
+    - { id: f03, from: { node: insert_pesanan }, to: { node: select_pesanan_baru } }
+    - { id: f04, from: { node: select_pesanan_baru }, to: { node: shape_response } }
+    - { id: f04b, from: { node: shape_response }, to: { node: respond } }
+    - { id: f06, from: { node: rejected_response }, to: { node: respond-rejected } }
+    - { id: f07, from: { node: respond }, to: { node: end } }
+    - { id: f08, from: { node: respond-rejected }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: insert_result, type: object }
+    - { name: pesanan_result, type: object }
+    - { name: final_response, type: object }
+    - { name: rejected_response, type: object }

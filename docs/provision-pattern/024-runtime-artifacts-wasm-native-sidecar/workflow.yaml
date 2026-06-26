@@ -1,0 +1,127 @@
+version: "3.0"
+metadata:
+  id: runtime-artifacts-wasm-native-sidecar
+  name: "Runtime Artifacts WASM Native Sidecar"
+  description: |
+    Runtime-local pricing workflow that invokes WASM, native-code, and sidecar
+    handler paths. The live smoke registers a real sidecar process and lets
+    WASM/native fall back to explicit runtime stubs unless binaries are
+    provided by the operator artifact harness.
+  dialect: vflow
+  tags: [example, p0, artifacts, wasm, native, sidecar]
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        route: /examples/artifacts/pricing
+        webhook_config: { path: /examples/artifacts/pricing, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: validate_pricing_request
+      activity_type: Validate
+      validate_config:
+        input: "$.trigger_payload.body"
+        schema:
+          required: [order_id, currency, items]
+          properties:
+            order_id: { type: string, min_length: 3 }
+            currency: { type: string, min_length: 3, max_length: 3 }
+            items: { type: array, min: 1 }
+      output_variable: validated_pricing_request
+
+    - id: wasm_discount_hint
+      activity_type: Function
+      persistence: skip
+      wasm_config:
+        module_ref: pricing_discount
+        function_name: execute
+        timeout_ms: 2000
+        pool_size: 1
+      input_mappings:
+        - target: body
+          source: { language: spv1, source: "$.trigger_payload.body" }
+      output_variable: wasm_discount
+
+    - id: native_tax_policy
+      activity_type: NativeCode
+      persistence: skip
+      code_config:
+        handler_ref: pricing_tax_policy
+        timeout_ms: 2000
+      input_mappings:
+        - target: body
+          source: { language: spv1, source: "$.trigger_payload.body" }
+        - target: discount_hint
+          source: { language: spv1, source: "$.wasm_discount" }
+      output_variable: native_policy
+
+    - id: sidecar_quote
+      activity_type: Sidecar
+      persistence: ssot
+      sidecar_config:
+        target: pricing_sidecar
+        method: execute
+        timeout_ms: 5000
+        pool_size: 1
+      input_mappings:
+        - target: body
+          source:
+            language: v-cel
+            source: '{"order_id": trigger_payload.body.order_id, "currency": trigger_payload.body.currency, "items": trigger_payload.body.items, "wasm_discount": wasm_discount, "native_policy": native_policy}'
+      output_variable: sidecar_quote
+
+    - id: response
+      activity_type: Transform
+      input_mappings:
+        - target: body
+          source:
+            language: v-cel
+            source: '{"status": sidecar_quote.status, "order_id": sidecar_quote.order_id, "currency": sidecar_quote.currency, "subtotal_cents": sidecar_quote.subtotal_cents, "discount_cents": sidecar_quote.discount_cents, "tax_cents": sidecar_quote.tax_cents, "final_price_cents": sidecar_quote.final_price_cents, "artifact_sources": {"wasm": wasm_discount, "native": native_policy, "sidecar": sidecar_quote._sidecar}}'
+      output_variable: final_response
+
+    - id: invalid_response
+      activity_type: Transform
+      input_mappings:
+        - target: response
+          source:
+            language: literal
+            source: '{"status":"invalid","reason":"pricing request failed validation"}'
+      output_variable: invalid_response
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.final_response" }
+
+    - id: respond-invalid
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: spv1, source: "$.invalid_response" }
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f01, from: { node: trigger }, to: { node: validate_pricing_request } }
+    - { id: f02, from: { node: validate_pricing_request }, to: { node: wasm_discount_hint } }
+    - { id: f03, from: { node: wasm_discount_hint }, to: { node: native_tax_policy } }
+    - { id: f04, from: { node: native_tax_policy }, to: { node: sidecar_quote } }
+    - { id: f05, from: { node: sidecar_quote }, to: { node: response } }
+    - { id: f06, from: { node: response }, to: { node: respond } }
+    - { id: f07, type: error, from: { node: validate_pricing_request }, to: { node: invalid_response } }
+    - { id: f08, from: { node: invalid_response }, to: { node: respond-invalid } }
+    - { id: f09, from: { node: respond }, to: { node: end } }
+    - { id: f10, from: { node: respond-invalid }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: wasm_discount, type: object }
+    - { name: native_policy, type: object }
+    - { name: sidecar_quote, type: object }

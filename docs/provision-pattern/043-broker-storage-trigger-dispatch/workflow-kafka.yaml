@@ -1,0 +1,44 @@
+version: "3.0"
+metadata:
+  id: broker-storage-trigger-kafka
+  name: "Kafka trigger dispatch"
+  description: "Kafka topic publish dispatches into a runtime-local workflow side effect."
+  dialect: vflow
+  tags: [example, p0, trigger, kafka, blackbox]
+
+spec:
+  activities:
+    - id: kafka_in
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: kafka
+        route: /examples/p0/triggers/kafka
+        kafka:
+          brokers: "__KAFKA_BROKERS__"
+          topics: ["__KAFKA_TOPIC__"]
+          group_id: "__KAFKA_GROUP_ID__"
+      output_variable: trigger_payload
+
+    - id: capture
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.http
+        operation: post
+        timeout_ms: 3000
+      input_mappings:
+        - target: url
+          source: { language: literal, source: "__CAPTURE_URL__/events/kafka" }
+        - target: body
+          source: { language: v-cel, source: "trigger_payload" }
+      output_variable: capture_result
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f1, from: { node: kafka_in }, to: { node: capture } }
+    - { id: f2, from: { node: capture }, to: { node: end } }
+
+  variables:
+    - { name: trigger_payload, type: object }
+    - { name: capture_result, type: object }

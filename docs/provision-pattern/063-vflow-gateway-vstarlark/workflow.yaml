@@ -1,0 +1,209 @@
+version: "3.0"
+metadata:
+  id: vflow-gateway-vstarlark
+  name: "vflow Gateway with V-Starlark validation + gRPC connector forward"
+  description: |
+    Head-to-head with `Envoy + Lua filter` proxying to the same upstream.
+    This workflow plays the role of a light gRPC API-gateway. **All
+    business logic lives in V-Starlark** (apple-to-apple with the Lua
+    filter on the Envoy side); v-cel only appears in narrow plumbing
+    roles (binding adapter into V-Starlark `ctx`, and the
+    `proto_encode` serialization helper).
+
+      1. Receives `examples.GatewayProxy/Passthrough` over gRPC.
+      2. **`gateway_logic` (V-Starlark)** — validates api-key header,
+         validates tenant_id presence, normalizes trace_id, builds
+         the upstream request payload.
+      3. `forward` (gRPC connector) — calls `examples.Gateway/Passthrough`
+         on 127.0.0.1:50071.
+      4. **`shape_response` (V-Starlark)** — gateway-side response
+         shaping (symmetric with request shaping; mirror of
+         `envoy_on_response` in Lua).
+      5. `encode_response` (v-cel `proto_encode`) — pure
+         JSON→protobuf serialization (not business logic).
+      6. EndTrigger via `bytes_ref`.
+
+  dialect: vflow
+  tags: [example, p0, grpc, gateway, vstarlark, connector, bench]
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: grpc
+        runtime_mode: fastpath
+        grpc:
+          service: "examples.GatewayProxy"
+          method: "Passthrough"
+          body_schema: "examples.GatewayMessage"
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    # Business logic in V-Starlark: read whole body, validate auth +
+    # tenant, normalize the upstream request payload. This is the
+    # gateway's "scripted gateway logic" — apple-to-apple with the
+    # Envoy Lua filter that does the same kind of work.
+    - id: gateway_logic
+      activity_type: Compute
+      compute_config:
+        language: v-starlark
+        source: |
+          def run(ctx):
+              # Light auth: api-key header must be either empty
+              # (open) or match a known value. Mirrors Envoy Lua's
+              # `headers:get("x-api-key")` compare.
+              api_key = ctx["api_key"]
+              if api_key and api_key != "demo-key":
+                  return {
+                      "ok": False,
+                      "reason": "invalid api key",
+                      "request": None,
+                  }
+
+              # Tenant validation
+              tenant = ctx["tenant_id"]
+              if not tenant:
+                  return {
+                      "ok": False,
+                      "reason": "missing tenant_id",
+                      "request": None,
+                  }
+
+              # Normalize: ensure trace_id is set (auto-generate if
+              # missing — typical gateway responsibility)
+              trace = ctx["trace_id"]
+              if not trace:
+                  trace = "trace-" + tenant
+
+              # Build the upstream request payload
+              return {
+                  "ok": True,
+                  "request": {
+                      "tenant_id": tenant,
+                      "trace_id":  trace,
+                      "payload":   ctx["payload"],
+                  },
+              }
+        entry_fn: run
+        budget_profile: none
+        timeout_ms: 1000
+      input_mappings:
+        # Each proto-bound field flows in as a typed scalar; the
+        # proto-field tier in fastpath dispatches these without
+        # entering the v-cel VM. Same pattern as 048.
+        - target: tenant_id
+          source: { language: v-cel, source: 'trigger_body.tenant_id' }
+        - target: trace_id
+          source: { language: v-cel, source: 'trigger_body.trace_id' }
+        - target: payload
+          source: { language: v-cel, source: 'trigger_body.payload' }
+        - target: api_key
+          source: { language: spv1, source: "$.trigger_payload.headers.x-api-key" }
+      output_variable: gateway
+
+    - id: forward
+      activity_type: Connector
+      connector_config:
+        connector_ref: vastar.grpc
+        operation: call
+        timeout_ms: 5000
+      input_mappings:
+        - target: endpoint
+          source: { language: literal, source: "http://127.0.0.1:50071" }
+        - target: descriptor_set_b64
+          source:
+            language: literal
+            source: "CqYCCg1nYXRld2F5LnByb3RvEghleGFtcGxlcyJiCg5HYXRld2F5TWVzc2FnZRIbCgl0ZW5hbnRfaWQYASABKAlSCHRlbmFudElkEhkKCHRyYWNlX2lkGAIgASgJUgd0cmFjZUlkEhgKB3BheWxvYWQYAyABKAlSB3BheWxvYWQyTAoHR2F0ZXdheRJBCgtQYXNzdGhyb3VnaBIYLmV4YW1wbGVzLkdhdGV3YXlNZXNzYWdlGhguZXhhbXBsZXMuR2F0ZXdheU1lc3NhZ2UyUQoMR2F0ZXdheVByb3h5EkEKC1Bhc3N0aHJvdWdoEhguZXhhbXBsZXMuR2F0ZXdheU1lc3NhZ2UaGC5leGFtcGxlcy5HYXRld2F5TWVzc2FnZWIGcHJvdG8z"
+        - target: service
+          source: { language: literal, source: "examples.Gateway" }
+        - target: method
+          source: { language: literal, source: "Passthrough" }
+        # Use the V-Starlark-prepared payload, NOT the raw trigger body
+        - target: request
+          source: { language: spv1, source: "$.gateway.request" }
+      output_variable: upstream_response
+
+    # Final response shaping in V-Starlark too — the gateway can
+    # add gateway-side metadata (e.g. trace_id propagation) before
+    # returning. Equivalent to envoy_on_response in Lua.
+    - id: shape_response
+      activity_type: Compute
+      compute_config:
+        language: v-starlark
+        source: |
+          def run(ctx):
+              # Pass-through, but explicitly through V-Starlark so
+              # the response-shaping step is symmetric with the
+              # request-shaping step (and with envoy_on_response
+              # in the Envoy Lua filter).
+              return {
+                  "tenant_id": ctx["tenant_id"],
+                  "trace_id":  ctx["trace_id"],
+                  "payload":   ctx["payload"],
+              }
+        entry_fn: run
+        budget_profile: none
+        timeout_ms: 1000
+      input_mappings:
+        - target: tenant_id
+          source: { language: spv1, source: "$.upstream_response.tenant_id" }
+        - target: trace_id
+          source: { language: spv1, source: "$.upstream_response.trace_id" }
+        - target: payload
+          source: { language: spv1, source: "$.upstream_response.payload" }
+      output_variable: shaped
+
+    # Pure plumbing: encode the V-Starlark-shaped JSON to proto
+    # bytes. This is serialization, not business logic — kept in
+    # v-cel `proto_encode` because that's its dedicated job.
+    - id: encode_response
+      activity_type: Transform
+      input_mappings:
+        - target: encoded_response
+          source:
+            language: v-cel
+            source: >
+              proto_encode(
+                {
+                  "name": "GatewayMessage",
+                  "fields": [
+                    {"name": "tenant_id", "number": 1, "type": "string"},
+                    {"name": "trace_id",  "number": 2, "type": "string"},
+                    {"name": "payload",   "number": 3, "type": "string"}
+                  ]
+                },
+                {
+                  "tenant_id": shaped.tenant_id,
+                  "trace_id":  shaped.trace_id,
+                  "payload":   shaped.payload
+                }
+              )
+      output_variable: encoded_response
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response:
+          language: bytes_ref
+          source: "encoded_response"
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f1, from: { node: trigger },         to: { node: gateway_logic } }
+    - { id: f2, from: { node: gateway_logic },   to: { node: forward } }
+    - { id: f3, from: { node: forward },         to: { node: shape_response } }
+    - { id: f4, from: { node: shape_response },  to: { node: encode_response } }
+    - { id: f5, from: { node: encode_response }, to: { node: respond } }
+    - { id: f6, from: { node: respond },         to: { node: end } }
+
+  variables:
+    - { name: trigger_payload,   type: object }
+    - { name: gateway,           type: object }
+    - { name: upstream_response, type: object }
+    - { name: shaped,            type: object }
+    - { name: encoded_response,  type: string }

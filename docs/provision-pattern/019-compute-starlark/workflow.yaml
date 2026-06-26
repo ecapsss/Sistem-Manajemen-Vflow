@@ -1,0 +1,62 @@
+version: "3.0"
+metadata:
+  id: compute-starlark
+  name: "P1 Compute/Starlark public example"
+  description: |
+    Runtime-local workflow example for side-effect-free Starlark/V-Starlark
+    compute. This demonstrates the public Compute activity config without
+    requiring external infra or cloud control-plane traffic.
+
+spec:
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        runtime_mode: fastpath
+        webhook_config: { path: /examples/compute-starlark, method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+
+    - id: pricing
+      activity_type: Compute
+      compute_config:
+        language: v-starlark
+        source: |
+          def run(ctx):
+              base = ctx["base"]
+              discount = 0
+              for tier in ctx["tiers"]:
+                  if base >= tier["min"]:
+                      discount = tier["pct"]
+              return {
+                  "base": base,
+                  "discount_pct": discount,
+                  "final_price": base * (100 - discount) // 100,
+              }
+        entry_fn: run
+        budget_profile: balanced
+        timeout_ms: 3000
+      input_mappings:
+        - target: base
+          source: { language: spv1, source: '$.trigger_payload.body.subtotal' }
+        - target: tiers
+          source: { language: spv1, source: '$.trigger_payload.body.tiers' }
+      output_variable: price_quote
+
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response:
+          language: spv1
+          source: '$.price_quote'
+
+    - id: end
+      activity_type: End
+
+  flows:
+    - { id: f1, from: { node: trigger }, to: { node: pricing } }
+    - { id: f2, from: { node: pricing }, to: { node: respond } }
+    - { id: f3, from: { node: respond }, to: { node: end } }

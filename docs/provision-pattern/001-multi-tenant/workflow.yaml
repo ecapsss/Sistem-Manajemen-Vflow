@@ -1,0 +1,38 @@
+version: "3.0"
+metadata:
+  id: tenant-scoring
+  name: "Multi-Tenant Credit Scoring"
+  # VFlow-exclusive: namespace routing, DB prefix per tenant
+spec:
+  tenant_config:
+    namespace: "{tenant_id}/scoring"
+    db_prefix: "{tenant_id}__"
+  activities:
+    - id: trigger
+      activity_type: Trigger
+      trigger_config:
+        trigger_type: webhook
+        webhook_config: { path: "/api/{tenant_id}/score", method: POST }
+        response_framing: length_prefixed
+        end_activity: respond
+      output_variable: trigger_payload
+    - id: score
+      activity_type: VRule
+      rule_config:
+        rule_set_id: credit_scoring_v1
+        tenant_id: "{tenant_id}"
+      input_mappings:
+        - target: applicant
+          source: { language: v-cel, source: 'trigger_payload.body' }
+      output_variable: result
+    - id: respond
+      activity_type: EndTrigger
+      end_trigger_config:
+        trigger_ref: trigger
+        final_response: { language: v-cel, source: 'result' }
+    - id: end
+      activity_type: End
+  flows:
+    - { id: f1, from: { node: trigger }, to: { node: score } }
+    - { id: f2, from: { node: score }, to: { node: respond } }
+    - { id: f3, from: { node: respond }, to: { node: end } }
